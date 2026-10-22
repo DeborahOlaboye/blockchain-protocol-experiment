@@ -72,9 +72,12 @@ fn tx_env(tx: &PendingTransaction) -> TxEnv {
         caller: tx.from,
         gas_limit: tx.gas,
         gas_price: tx.gas_price,
-        kind: TxKind::Call(tx.to),
+        kind: match tx.to {
+            Some(to) => TxKind::Call(to),
+            None => TxKind::Create,
+        },
         value: tx.value,
-        data: Bytes::new(),
+        data: tx.input.clone(),
         nonce: tx.nonce,
         chain_id: Some(tx.chain_id),
         ..Default::default()
@@ -139,12 +142,28 @@ pub fn execute_block(
     let mut transactions = Vec::new();
     let mut receipts = Vec::new();
     let mut gas_used = 0u64;
+    let mut log_index = 0u64;
 
     for tx in batch {
         match execute_transaction(&mut db, block, tx) {
             Ok(outcome) => {
                 let index = transactions.len() as u64;
                 gas_used += outcome.gas_used;
+
+                let logs = outcome
+                    .logs
+                    .iter()
+                    .map(|log| {
+                        let log = primitives::node::Log {
+                            address: log.address,
+                            topics: log.topics().to_vec(),
+                            data: log.data.data.clone(),
+                            log_index,
+                        };
+                        log_index += 1;
+                        log
+                    })
+                    .collect();
 
                 transactions.push(Transaction {
                     hash: tx.hash,
@@ -160,7 +179,7 @@ pub fn execute_block(
                     nonce: tx.nonce,
                     gas: tx.gas,
                     gas_price: tx.gas_price,
-                    input: Default::default(),
+                    input: tx.input.clone(),
                     v: tx.v,
                     r: tx.r,
                     s: tx.s,
@@ -176,6 +195,8 @@ pub fn execute_block(
                     gas_used: outcome.gas_used,
                     cummulative_gas_used: gas_used,
                     effective_gas_price: tx.gas_price,
+                    contract_address: outcome.created,
+                    logs,
                     status: outcome.success as u8,
                 });
             }
@@ -237,16 +258,84 @@ mod tests {
         PendingTransaction {
             hash: B256::repeat_byte(0xab),
             from: DEV_ADDRESS,
-            to: DEV_ADDRESS_1,
+            to: Some(DEV_ADDRESS_1),
             value,
             nonce,
             gas: TRANSFER_GAS,
             gas_price: GAS_PRICE,
+            input: Bytes::new(),
             chain_id: 1,
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
         }
+    }
+
+    fn contract_tx(to: Option<Address>, input: &[u8], nonce: u64, gas: u64) -> PendingTransaction {
+        PendingTransaction {
+            to,
+            input: Bytes::copy_from_slice(input),
+            gas,
+            ..transfer(U256::ZERO, nonce)
+        }
+    }
+
+    const STORE_AND_LOG_INITCODE: [u8; 23] = [
+        0x60, 0x0b, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0b, 0x60, 0x00, 0xf3, 0x60, 0x2a, 0x60,
+        0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00,
+    ];
+
+    #[test]
+    fn a_deployment_reports_its_address_and_a_call_runs_the_code() {
+        let miner = Address::repeat_byte(0x99);
+        let mut db = funded(one_eth());
+
+        let deployed = execute_transaction(
+            &mut db,
+            &block(miner),
+            &contract_tx(None, &STORE_AND_LOG_INITCODE, 0, 100_000),
+        )
+        .unwrap();
+        assert!(deployed.success);
+        let contract = deployed.created.expect("a deployment creates an address");
+        assert_eq!(contract, DEV_ADDRESS.create(0));
+
+        let called = execute_transaction(
+            &mut db,
+            &block(miner),
+            &contract_tx(Some(contract), &[], 1, 100_000),
+        )
+        .unwrap();
+        assert!(called.success);
+        assert_eq!(called.logs.len(), 1);
+        assert_eq!(called.logs[0].address, contract);
+        assert_eq!(db.accounts[&contract].storage[&U256::ZERO], U256::from(42u64));
+    }
+
+    #[test]
+    fn running_out_of_gas_halts_and_consumes_the_whole_limit() {
+        let miner = Address::repeat_byte(0x99);
+        let mut db = funded(one_eth());
+        let contract = execute_transaction(
+            &mut db,
+            &block(miner),
+            &contract_tx(None, &STORE_AND_LOG_INITCODE, 0, 100_000),
+        )
+        .unwrap()
+        .created
+        .unwrap();
+
+        let starved = execute_transaction(
+            &mut db,
+            &block(miner),
+            &contract_tx(Some(contract), &[], 1, 22_000),
+        )
+        .unwrap();
+
+        assert!(!starved.success);
+        assert_eq!(starved.gas_used, 22_000);
+        assert_eq!(db.accounts[&DEV_ADDRESS].nonce, 2);
+        assert!(db.accounts[&contract].storage.is_empty());
     }
 
     #[test]

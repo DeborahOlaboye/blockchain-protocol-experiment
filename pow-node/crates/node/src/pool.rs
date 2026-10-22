@@ -3,7 +3,10 @@ use alloy::consensus::{Transaction as TxTrait, TxEnvelope, TxType};
 use alloy::eips::Decodable2718;
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use primitives::{
-    constants::{CHAIN_ID, GAS_PRICE, TRANSFER_GAS},
+    constants::{
+        CHAIN_ID, GAS_PRICE, INITCODE_WORD_GAS, TRANSFER_GAS, TX_CREATE_GAS, TX_DATA_NON_ZERO_GAS,
+        TX_DATA_ZERO_GAS,
+    },
     node::{BlockState, PendingTransaction},
 };
 
@@ -12,11 +15,12 @@ use primitives::{
 struct DecodedTransaction {
     hash: B256,
     from: Address,
-    to: Address,
+    to: Option<Address>,
     value: U256,
     nonce: u64,
     gas: u64,
     gas_price: u128,
+    input: Bytes,
     chain_id: u64,
     v: u64,
     r: U256,
@@ -59,27 +63,16 @@ fn decode_and_check(raw: &Bytes) -> Result<DecodedTransaction, anyhow::Error> {
         None => CHAIN_ID,
     };
 
-    // No EVM means no contract creation.
     let to = match envelope.kind() {
-        TxKind::Call(to) => to,
-        TxKind::Create => anyhow::bail!(
-            "contract creation is not supported: this node has no EVM and only \
-             processes ETH transfers"
-        ),
+        TxKind::Call(to) => Some(to),
+        TxKind::Create => None,
     };
-
-    // ...and no contract calls either. Calldata would need an interpreter.
-    if !envelope.input().is_empty() {
-        anyhow::bail!(
-            "transaction carries {} bytes of calldata: this node has no EVM and \
-             only processes plain ETH transfers",
-            envelope.input().len()
-        );
-    }
+    let input = envelope.input().clone();
 
     let gas = envelope.gas_limit();
-    if gas < TRANSFER_GAS {
-        anyhow::bail!("gas limit {gas} is below the intrinsic cost of a transfer ({TRANSFER_GAS})");
+    let intrinsic = intrinsic_gas(&input, to.is_none());
+    if gas < intrinsic {
+        anyhow::bail!("gas limit {gas} is below the intrinsic cost of this transaction ({intrinsic})");
     }
 
     let gas_price = envelope.max_fee_per_gas();
@@ -96,11 +89,23 @@ fn decode_and_check(raw: &Bytes) -> Result<DecodedTransaction, anyhow::Error> {
         nonce: envelope.nonce(),
         gas,
         gas_price,
+        input,
         chain_id,
         v: legacy_v(signature.v(), envelope.chain_id()),
         r: signature.r(),
         s: signature.s(),
     })
+}
+
+pub fn intrinsic_gas(input: &[u8], is_create: bool) -> u64 {
+    let zero_bytes = input.iter().filter(|byte| **byte == 0).count() as u64;
+    let non_zero_bytes = input.len() as u64 - zero_bytes;
+    let mut gas =
+        TRANSFER_GAS + zero_bytes * TX_DATA_ZERO_GAS + non_zero_bytes * TX_DATA_NON_ZERO_GAS;
+    if is_create {
+        gas += TX_CREATE_GAS + (input.len() as u64).div_ceil(32) * INITCODE_WORD_GAS;
+    }
+    gas
 }
 
 /// Reconstructs the `v` value a legacy transaction reports over JSON-RPC.
@@ -144,9 +149,6 @@ pub fn admit(state: &mut BlockState, raw: &Bytes) -> Result<B256, anyhow::Error>
         );
     }
 
-    // Ethereum reserves the full gas limit up front and refunds whatever the
-    // transaction does not burn. Breeja always burns exactly the intrinsic cost,
-    // but it reserves the limit anyway so the accounting matches.
     let max_cost = tx.value + U256::from(tx.gas) * U256::from(tx.gas_price);
     let available = state.get_pending_balance(&tx.from);
     if available < max_cost {
@@ -165,6 +167,7 @@ pub fn admit(state: &mut BlockState, raw: &Bytes) -> Result<B256, anyhow::Error>
         nonce: tx.nonce,
         gas: tx.gas,
         gas_price: tx.gas_price,
+        input: tx.input,
         chain_id: tx.chain_id,
         v: tx.v,
         r: tx.r,
@@ -186,6 +189,35 @@ mod tests {
         // EIP-155 on chain 1: 37 or 38.
         assert_eq!(legacy_v(false, Some(1)), 37);
         assert_eq!(legacy_v(true, Some(1)), 38);
+    }
+
+    #[test]
+    fn intrinsic_gas_matches_revm_under_shanghai() {
+        use revm::{
+            context_interface::cfg::gas::calculate_initial_tx_gas,
+            primitives::hardfork::SpecId,
+        };
+
+        let initcode: &[u8] = &[
+            0x60, 0x0b, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0b, 0x60, 0x00, 0xf3, 0x60, 0x2a,
+            0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00,
+        ];
+        let cases: [(&[u8], bool); 5] = [
+            (&[], false),
+            (&[0x00, 0x00, 0x01], false),
+            (&[0xde, 0xad, 0xbe, 0xef], false),
+            (initcode, true),
+            (&[0u8; 33], true),
+        ];
+        for (input, is_create) in cases {
+            let revm = calculate_initial_tx_gas(SpecId::SHANGHAI, input, is_create, 0, 0, 0, None);
+            assert_eq!(
+                intrinsic_gas(input, is_create),
+                revm.initial_regular_gas,
+                "input {input:?}, create {is_create}"
+            );
+        }
+        assert_eq!(intrinsic_gas(&[], false), TRANSFER_GAS);
     }
 
     #[test]

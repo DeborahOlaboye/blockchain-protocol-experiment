@@ -74,9 +74,6 @@ pub struct BlockHeader {
 }
 
 /// A transaction that has been included in a block.
-///
-/// `input` is always empty: Breeja rejects anything with calldata, because it
-/// has no EVM to run it with.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
@@ -86,7 +83,7 @@ pub struct Transaction {
     pub transaction_index: u64,
     pub chain_id: u64,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
     pub value: U256,
     pub nonce: u64,
     pub gas: u64,
@@ -106,13 +103,22 @@ pub struct TransactionReceipt {
     pub block_hash: B256,
     pub block_number: u64,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
     pub gas_used: u64,
     pub cummulative_gas_used: u64,
     pub effective_gas_price: u128,
-    /// `1` for success. Breeja only ever includes transactions it has already
-    /// validated, so a receipt is never a failure.
+    pub contract_address: Option<Address>,
+    pub logs: Vec<Log>,
     pub status: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Log {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Bytes,
+    pub log_index: u64,
 }
 
 /// A transaction that has been accepted into the mempool but not yet mined.
@@ -120,11 +126,12 @@ pub struct TransactionReceipt {
 pub struct PendingTransaction {
     pub hash: B256,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
     pub value: U256,
     pub nonce: u64,
     pub gas: u64,
     pub gas_price: u128,
+    pub input: Bytes,
     pub chain_id: u64,
     pub v: u64,
     pub r: U256,
@@ -645,11 +652,12 @@ mod tests {
         state.add_to_mempool(PendingTransaction {
             hash: B256::repeat_byte(0xaa),
             from: sender,
-            to: Address::repeat_byte(0x22),
+            to: Some(Address::repeat_byte(0x22)),
             value: one_eth,
             nonce: 0,
             gas: TRANSFER_GAS,
             gas_price: GAS_PRICE,
+            input: Bytes::new(),
             chain_id: 1,
             v: 0,
             r: U256::ZERO,

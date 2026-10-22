@@ -261,3 +261,110 @@ tests for that come in Milestone 3.
 `cargo run --release -- --dev`, then the README's `cast mktx` transfer of 1 ETH from
 `0xf39F…2266` to `0x7099…79C8`. It was mined in block 17 with `gasUsed: 0x5208` and
 `status: 0x1`, and the recipient's balance went from 10,000 to 10,001 ETH.
+
+## Milestone 3: contracts
+
+### Mempool rules (Part 0, Q1 carried out)
+
+- The `TxKind::Create` rejection and the non-empty-calldata rejection are **removed**.
+- The flat `gas < TRANSFER_GAS` floor is **replaced** by `pool::intrinsic_gas(input,
+  is_create)`:
+  `21,000 + 4 × zero bytes + 16 × non-zero bytes`, plus, for a creation,
+  `32,000 + 2 × ceil(len / 32)`. The last term is EIP-3860's initcode word cost,
+  which is part of Shanghai. A plain transfer still comes out at exactly 21,000.
+  The unit test `intrinsic_gas_matches_revm_under_shanghai` compares my function
+  against REVM's own `calculate_initial_tx_gas(SpecId::SHANGHAI, ..)` for five
+  inputs, including the test contract's initcode and a 33-byte initcode that crosses
+  a word boundary. If the two ever disagree, the pool would admit transactions the
+  miner then drops, or reject ones the EVM would run.
+- The reservation check (`value + gas × gas_price` must be available) is unchanged.
+  Part 0 Q3 explains why it is now required rather than just matching Ethereum.
+
+### Data model
+
+- `PendingTransaction`, `Transaction`, and `TransactionReceipt` now have
+  `to: Option<Address>`. `None` is a deployment. Over JSON-RPC it serializes as
+  `"to": null`, as on Ethereum, not as the zero address. The zero address is a real
+  address, and sending to it is a transfer, not a deployment.
+- `PendingTransaction` gained `input`. `Transaction.input` now stores the real
+  calldata instead of `Default::default()`.
+- New `primitives::node::Log { address, topics, data, log_index }`. `log_index` is the
+  position within the **block**, not within the transaction, because that is what
+  `logIndex` means in Ethereum's JSON-RPC.
+- `TransactionReceipt` gained `contract_address` (from
+  `ExecutionResult::created_address()`) and `logs` (from `ExecutionResult::logs()`).
+  `status` comes from `is_success()`: `Success` → 1, `Revert` and `Halt` → 0.
+- `LogResponse` renders a log with its block number, block hash, transaction hash,
+  transaction index, log index, and `removed: false`. Breeja has no reorgs, so
+  `removed` is always false. The same type will serve `eth_getLogs` in Milestone 5.
+
+### Failed transactions are included
+
+This is the behaviour change from Part 0 Q2. `execute_block` drops a transaction only
+when REVM refuses it outright (`transact` returns `Err`: bad nonce, or cannot afford
+the up-front reservation). A transaction that executes and reverts or halts is
+mined, charged, and its nonce advances. The upstream doc comment on `execute_block`
+described the old skip-everything behaviour, so I removed it rather than leave it
+wrong.
+
+### Test contracts (`testing.rs`)
+
+- `STORE_AND_LOG_INITCODE` / `STORE_AND_LOG_RUNTIME`: the contract from the spec
+  (`storage[0] = 42`, then an empty `LOG0`).
+- `STORE_THEN_REVERT_INITCODE` / `STORE_THEN_REVERT_RUNTIME`, which I hand-assembled
+  the same way:
+
+  ```text
+  initcode: 600a 600c 6000 39 600a 6000 f3   copy 10 bytes from offset 12, return them
+  runtime:  602a 6000 55                     storage[0] = 42
+            6000 6000 fd                     REVERT with no data
+  ```
+
+  It writes storage **before** reverting, so the test also proves the revert rolls
+  the write back, not just that the status is 0.
+- `sign_deployment`, `sign_call`, and the general `sign_legacy` they share with
+  `sign_transfer_with`.
+
+### Tests
+
+Integration (`crates/node/tests/contracts.rs`), through the real mempool and miner:
+
+| Test | Asserts |
+| --- | --- |
+| `deploying_a_contract_sets_contract_address_and_commits_its_code` | `status 1`, `to == None`, `contract_address == sender.create(0)`, gas in 55,000–56,000, `get_code` returns exactly the 11 runtime bytes, the contract's nonce is 1 (EIP-161), and the stored transaction keeps `to: None` and the initcode |
+| `calling_a_contract_changes_storage_and_emits_a_log` | Slot 0 goes from 0 to 42, one log whose address is the contract with no topics or data, `contract_address == None`, gas in 43,000–44,000 |
+| `a_reverting_transaction_is_mined_with_status_zero_and_still_charged` | `status 0`, the transaction is in the block, nonce is 2, Alice's balance is exactly `start − (deploy_gas + call_gas) × 1 gwei`, no logs, slot 0 still 0 |
+
+Unit (`executor.rs`): `a_deployment_reports_its_address_and_a_call_runs_the_code`,
+and `running_out_of_gas_halts_and_consumes_the_whole_limit`. The second calls the
+store contract with a 22,000 gas limit: it halts, uses all 22,000, still bumps the
+nonce, and leaves storage empty. This is the `Halt` variant, as opposed to `Revert`.
+
+One existing test changed: `mining.rs` now compares `tx.to` with `Some(bob)` instead
+of `bob`. That is a type change only. The expectation (Bob is the recipient) is the
+same, so it has no justification comment.
+
+`cargo test --workspace`: **60 passed**. `cargo clippy --all-targets`: clean.
+
+### Manual check against a live `--dev` node
+
+Deployed the spec's initcode with `cast mktx --legacy --create …`, then called the
+contract with `cast mktx` to its address:
+
+| | Gas used | Spec's reference |
+| --- | --- | --- |
+| Deployment | **55,522** | ~55,522 |
+| Call | **43,487** | ~43,487 |
+
+The deploy receipt had `contractAddress: 0x5fbdb2315678afecb367f032d93f642f64180aa3`
+(the familiar first-deployment address for this dev key) and `to: null`. The call
+receipt had one log at that address with `topics: []`, `data: 0x`, and `logIndex: 0x0`.
+
+### Known gaps at this point
+
+- `logsBloom` is still 256 zero bytes, even for a receipt with logs (Milestone 6).
+- A transaction whose gas limit is above `BLOCK_GAS_LIMIT` is still admitted to the
+  mempool, but REVM will refuse it at execution, so it would sit in the pool forever
+  (fixed in Milestone 6).
+- EIP-3860's 49,152-byte initcode size limit is enforced by REVM at execution but not
+  by the pool, so an oversized deployment is admitted and then dropped.

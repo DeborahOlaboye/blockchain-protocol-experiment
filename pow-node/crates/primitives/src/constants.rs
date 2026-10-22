@@ -35,6 +35,11 @@ pub const GAS_PRICE: u128 = 1_000_000_000;
 /// *every* transaction Breeja accepts.
 pub const TRANSFER_GAS: u64 = 21_000;
 
+pub const TX_DATA_ZERO_GAS: u64 = 4;
+pub const TX_DATA_NON_ZERO_GAS: u64 = 16;
+pub const TX_CREATE_GAS: u64 = 32_000;
+pub const INITCODE_WORD_GAS: u64 = 2;
+
 /// Frontier's famous "pi million" block gas limit, which caps a block at
 /// `3_141_592 / 21_000 = 149` transfers.
 pub const BLOCK_GAS_LIMIT: u64 = 3_141_592;

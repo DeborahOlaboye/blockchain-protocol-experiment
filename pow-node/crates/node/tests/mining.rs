@@ -84,7 +84,7 @@ fn a_signed_transfer_is_mined_and_moves_the_eth() {
     assert_eq!(state.mempool_len(), 0);
     let tx = state.get_transaction(&tx_hash).unwrap();
     assert_eq!(tx.from, alice);
-    assert_eq!(tx.to, bob);
+    assert_eq!(tx.to, Some(bob));
     assert_eq!(tx.value, one_eth() * U256::from(5u64));
 
     // The block it landed in lists it.

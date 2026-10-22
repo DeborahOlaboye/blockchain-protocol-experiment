@@ -36,17 +36,77 @@ pub fn sign_transfer_with(
     gas_price: u128,
     gas_limit: u64,
 ) -> Result<Bytes, anyhow::Error> {
+    sign_legacy(
+        private_key,
+        TxKind::Call(to),
+        value,
+        Bytes::new(),
+        nonce,
+        gas_price,
+        gas_limit,
+    )
+}
+
+pub const STORE_AND_LOG_INITCODE: &str = "0x600b600c600039600b6000f3602a60005560006000a000";
+pub const STORE_AND_LOG_RUNTIME: &str = "0x602a60005560006000a000";
+
+pub const STORE_THEN_REVERT_INITCODE: &str = "0x600a600c600039600a6000f3602a60005560006000fd";
+pub const STORE_THEN_REVERT_RUNTIME: &str = "0x602a60005560006000fd";
+
+pub fn sign_deployment(
+    private_key: &str,
+    initcode: Bytes,
+    nonce: u64,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
+    sign_legacy(
+        private_key,
+        TxKind::Create,
+        U256::ZERO,
+        initcode,
+        nonce,
+        GAS_PRICE,
+        gas_limit,
+    )
+}
+
+pub fn sign_call(
+    private_key: &str,
+    to: Address,
+    calldata: Bytes,
+    nonce: u64,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
+    sign_legacy(
+        private_key,
+        TxKind::Call(to),
+        U256::ZERO,
+        calldata,
+        nonce,
+        GAS_PRICE,
+        gas_limit,
+    )
+}
+
+pub fn sign_legacy(
+    private_key: &str,
+    to: TxKind,
+    value: U256,
+    input: Bytes,
+    nonce: u64,
+    gas_price: u128,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
     let signer: PrivateKeySigner = private_key.parse()?;
 
-    // 1. The unsigned transaction. `input` is empty because this node has no EVM.
     let tx = TxLegacy {
         chain_id: Some(CHAIN_ID),
         nonce,
         gas_price,
         gas_limit,
-        to: TxKind::Call(to),
+        to,
         value,
-        input: Bytes::new(),
+        input,
     };
 
     // 2 and 3. Sign the signature hash, which commits to every field above.
