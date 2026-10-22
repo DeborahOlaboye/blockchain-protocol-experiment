@@ -10,10 +10,10 @@ use node::{
 use primitives::{
     constants::CHAIN_ID,
     node::BlockState,
-    params::{BlockTag, CallRequest},
+    params::{BlockTag, CallRequest, LogFilter},
     response::{
-        BlockResponse, TransactionReceiptResponse, TransactionResponse, data_bytes, data_hash,
-        quantity,
+        BlockResponse, LogResponse, TransactionReceiptResponse, TransactionResponse, data_bytes,
+        data_hash, data_word, quantity,
     },
 };
 use serde_json::Value;
@@ -280,4 +280,85 @@ pub fn estimate_gas_handler(params: Params<'_>, context: &RPCContext) -> RpcResu
     let (mut db, block) = simulation_snapshot(context, tag)?;
     let gas = estimate_gas(&mut db, &block, &request).map_err(invalid_input)?;
     Ok(quantity(gas))
+}
+
+pub fn gas_price_handler(context: &RPCContext) -> String {
+    quantity(context.chain.read().gas_price())
+}
+
+pub fn get_code_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let tag = sequence.optional_next::<BlockTag>()?;
+
+    let state = context.chain.read();
+    let number = resolve_tag(&state, &tag.unwrap_or(BlockTag::Latest))?;
+    let code = state
+        .get_code_at(&address, number)
+        .ok_or_else(|| invalid_input(format!("no state recorded for block {number}")))?;
+    Ok(data_bytes(&code))
+}
+
+pub fn get_storage_at_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let slot: U256 = sequence.next()?;
+    let tag = sequence.optional_next::<BlockTag>()?;
+
+    let state = context.chain.read();
+    let number = resolve_tag(&state, &tag.unwrap_or(BlockTag::Latest))?;
+    let value = state
+        .get_storage_at_block(&address, slot, number)
+        .ok_or_else(|| invalid_input(format!("no state recorded for block {number}")))?;
+    Ok(data_word(value))
+}
+
+pub fn get_logs_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<Value> {
+    let filter: LogFilter = params.one()?;
+
+    let state = context.chain.read();
+    let (from, to) = match filter.block_hash {
+        Some(hash) => {
+            if filter.from_block.is_some() || filter.to_block.is_some() {
+                return Err(invalid_params(
+                    "blockHash cannot be combined with fromBlock or toBlock",
+                ));
+            }
+            let number = state
+                .get_block_by_hash(&hash)
+                .map(|block| block.number)
+                .ok_or_else(|| invalid_input(format!("unknown block {hash}")))?;
+            (number, number)
+        }
+        None => {
+            let from = resolve_tag(&state, &filter.from_block.unwrap_or(BlockTag::Latest))?;
+            let to = resolve_tag(&state, &filter.to_block.unwrap_or(BlockTag::Latest))?;
+            if from > to {
+                return Err(invalid_input(format!(
+                    "fromBlock {from} is after toBlock {to}"
+                )));
+            }
+            (from, to)
+        }
+    };
+
+    let mut logs = Vec::new();
+    for number in from..=to {
+        let Some(block) = state.get_block(number) else {
+            continue;
+        };
+        for hash in &block.transactions {
+            let Some(receipt) = state.get_receipt(hash) else {
+                continue;
+            };
+            logs.extend(
+                receipt
+                    .logs
+                    .iter()
+                    .filter(|log| filter.matches(&log.address, &log.topics))
+                    .map(|log| LogResponse::new(receipt, log)),
+            );
+        }
+    }
+    Ok(serde_json::to_value(logs).expect("log responses always serialize"))
 }

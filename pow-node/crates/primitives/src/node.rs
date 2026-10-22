@@ -450,6 +450,25 @@ impl BlockState {
         self.code_by_hash(&self.get_account(address).code_hash)
     }
 
+    pub fn get_code_at(&self, address: &Address, number: u64) -> Option<Bytes> {
+        let snapshot = self.state_history.get(number as usize)?;
+        let code_hash = snapshot
+            .get(address)
+            .map(|account| account.code_hash)
+            .unwrap_or_default();
+        Some(self.code_by_hash(&code_hash))
+    }
+
+    pub fn get_storage_at_block(&self, address: &Address, slot: U256, number: u64) -> Option<U256> {
+        let snapshot = self.state_history.get(number as usize)?;
+        Some(
+            snapshot
+                .get(address)
+                .and_then(|account| account.storage.get(&slot).copied())
+                .unwrap_or_default(),
+        )
+    }
+
     pub fn code_by_hash(&self, code_hash: &B256) -> Bytes {
         self.code.get(code_hash).cloned().unwrap_or_default()
     }

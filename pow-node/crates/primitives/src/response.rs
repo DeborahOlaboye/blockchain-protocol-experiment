@@ -1,6 +1,6 @@
 use std::fmt::LowerHex;
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -30,6 +30,10 @@ pub fn data_address(address: &Address) -> String {
 /// Encodes a 32-byte hash as lowercase hex.
 pub fn data_hash(hash: &B256) -> String {
     format!("{hash:#x}")
+}
+
+pub fn data_word(value: U256) -> String {
+    format!("0x{value:064x}")
 }
 
 /// Encodes a byte string as lowercase hex, `0x` when empty.
@@ -97,6 +101,7 @@ pub struct TransactionReceiptResponse {
     pub from: String,
     pub to: Option<String>,
     pub gas_used: String,
+    #[serde(rename = "cumulativeGasUsed")]
     pub cummulative_gas_used: String,
     pub effective_gas_price: String,
     pub contract_address: Option<String>,

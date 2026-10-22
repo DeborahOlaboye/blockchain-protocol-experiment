@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 /// Which block a state query refers to.
@@ -88,9 +88,83 @@ impl CallRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T: PartialEq> OneOrMany<T> {
+    fn accepts(&self, value: &T) -> bool {
+        match self {
+            Self::One(wanted) => wanted == value,
+            Self::Many(wanted) => wanted.is_empty() || wanted.contains(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogFilter {
+    pub from_block: Option<BlockTag>,
+    pub to_block: Option<BlockTag>,
+    pub block_hash: Option<B256>,
+    pub address: Option<OneOrMany<Address>>,
+    pub topics: Option<Vec<Option<OneOrMany<B256>>>>,
+}
+
+impl LogFilter {
+    pub fn matches(&self, address: &Address, topics: &[B256]) -> bool {
+        if let Some(wanted) = &self.address
+            && !wanted.accepts(address)
+        {
+            return false;
+        }
+        let positions = self.topics.as_deref().unwrap_or_default();
+        if positions.len() > topics.len() {
+            return false;
+        }
+        positions
+            .iter()
+            .zip(topics)
+            .all(|(wanted, topic)| wanted.as_ref().is_none_or(|w| w.accepts(topic)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filter(json: serde_json::Value) -> LogFilter {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn log_filters_follow_the_positional_topic_rules() {
+        let contract = Address::repeat_byte(0x11);
+        let a = B256::repeat_byte(0xaa);
+        let b = B256::repeat_byte(0xbb);
+        let c = B256::repeat_byte(0xcc);
+        let log = [a, b];
+
+        assert!(filter(serde_json::json!({})).matches(&contract, &log));
+        assert!(filter(serde_json::json!({"topics": []})).matches(&contract, &log));
+        assert!(filter(serde_json::json!({"topics": [a]})).matches(&contract, &log));
+        assert!(!filter(serde_json::json!({"topics": [b]})).matches(&contract, &log));
+        assert!(filter(serde_json::json!({"topics": [null, b]})).matches(&contract, &log));
+        assert!(filter(serde_json::json!({"topics": [[c, a]]})).matches(&contract, &log));
+        assert!(!filter(serde_json::json!({"topics": [[c], b]})).matches(&contract, &log));
+        assert!(!filter(serde_json::json!({"topics": [a, b, null]})).matches(&contract, &log));
+        assert!(!filter(serde_json::json!({"topics": [a]})).matches(&contract, &[]));
+
+        assert!(filter(serde_json::json!({"address": contract})).matches(&contract, &log));
+        assert!(
+            filter(serde_json::json!({"address": [Address::ZERO, contract]}))
+                .matches(&contract, &log)
+        );
+        assert!(!filter(serde_json::json!({"address": Address::ZERO})).matches(&contract, &log));
+    }
 
     #[test]
     fn parses_every_block_tag_ethereum_defines() {

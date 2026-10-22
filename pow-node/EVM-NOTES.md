@@ -516,3 +516,119 @@ cast estimate --from … 0x7099…79C8 --value 1ether → 21000
 cast estimate --from … <contract>           → 47436   (minimum 43,124 + 10%)
 send with --gas-limit 47436                 → status 0x1, gasUsed 43124
 ```
+
+## Milestone 5: RPC methods for contracts
+
+Four methods added: `eth_gasPrice`, `eth_getCode`, `eth_getStorageAt`, `eth_getLogs`.
+The node now serves fifteen.
+
+### `eth_getCode` and `eth_getStorageAt`
+
+Both take a block tag and answer **historically**, not just at the head. This needs no
+new storage:
+
+- Code: the account's `code_hash` at block `n` comes from `state_history[n]`, and the
+  code map is append-only, so `BlockState::get_code_at(address, n)` is a lookup in
+  each.
+- Storage: `state_history[n]` holds each account's full storage as it was after
+  block `n`, so `get_storage_at_block(address, slot, n)` reads it directly.
+
+An address with no code returns `0x`. A slot is returned as a full 32-byte word
+(`data_word`, `0x` + 64 hex digits), not a minimal quantity, because
+`eth_getStorageAt` returns DATA. The slot parameter is accepted either as a quantity
+(`"0x0"`) or as a padded 32-byte value, since clients send both.
+
+### `eth_getLogs`
+
+`LogFilter` in `primitives/src/params.rs` accepts:
+
+- `fromBlock` / `toBlock` (any block tag, default `latest`), or `blockHash` (EIP-234).
+  Combining `blockHash` with either range field is rejected, and `fromBlock > toBlock`
+  is an error rather than an empty result.
+- `address`: one address or a list. A list means "any of these", and an empty list
+  matches everything.
+- `topics`: an array of **positions**. Each position is `null` (anything), one hash,
+  or a list of hashes (any of them).
+
+Topic matching is in `LogFilter::matches`. The parts that are genuinely unintuitive,
+each covered by `log_filters_follow_the_positional_topic_rules`:
+
+1. **Positions are AND, a list inside a position is OR.** `[A, B]` means topic0 = A
+   *and* topic1 = B. `[[A, C]]` means topic0 = A *or* C.
+2. **`null` is a positional wildcard, not "absent".** `[null, B]` matches any log whose
+   *second* topic is B.
+3. **A filter longer than the log never matches, even if the extra positions are
+   `null`.** `[A, B, null]` does not match a log with exactly topics `[A, B]`. I
+   followed geth here (`if len(filter.topics) > len(log.Topics) { continue }`). The
+   spec wording ("null matches anything") could be read either way, and a client
+   written against geth expects this.
+4. `[]` (or no `topics` field) matches every log, including ones with no topics at all.
+
+The handler walks blocks `from..=to`, then each block's transactions in order, then
+each receipt's logs, so results come back in chain order with their block-wide
+`logIndex`. **Limitation:** there is no cap on the range and no bloom-based skipping,
+so `fromBlock: earliest` scans the whole chain under the read lock. That is fine at
+teaching-chain sizes. A real node rejects huge ranges and uses `logsBloom` (Milestone
+6) to skip blocks that cannot match.
+
+### `eth_gasPrice`
+
+One line: `quantity(state.gas_price())`, which is the fixed 1 gwei. As the spec says,
+this is what makes stock tooling work. See the manual check below.
+
+### A bug found by using real tooling
+
+The first time I ran plain `cast send` against the node, it failed with
+`missing field cumulativeGasUsed`. The receipt response serialized that field as
+**`cummulativeGasUsed`**, a misspelling that predates this project. Every client
+library that parses receipts requires the spec name. The unit tests never caught it,
+because they only read fields they asked for by name.
+
+Fix: `#[serde(rename = "cumulativeGasUsed")]` on the response field. The internal Rust
+field names are unchanged, to keep the diff small. A regression assertion
+(`receipt["cumulativeGasUsed"] == "0x5208"`) was added to the existing transfer
+receipt test. That is a new expectation, not a changed one, so it carries no
+justification comment.
+
+### Tests
+
+Unit (`params.rs`): `log_filters_follow_the_positional_topic_rules`, 13 assertions over
+empty, single, wildcard, OR-list, too-long, and address filters.
+
+RPC (`json_rpc.rs`):
+
+| Test | Spec item |
+| --- | --- |
+| `eth_get_code_returns_runtime_bytecode_and_0x_without_code` | 10: exactly the 11 runtime bytes; `0x` for an EOA; `0x` for the contract at block `0x0` |
+| `eth_get_storage_at_returns_the_slot_as_a_32_byte_word` | 11: slot 0 is `0x` + 64 hex digits ending `2a`; the block before the call returns the zero word |
+| `eth_get_logs_filters_by_block_range_and_address` | 14: finds the log by `fromBlock`/`toBlock` + `address`; nothing in the range before it; nothing for another address; also found by `blockHash` |
+| `eth_get_logs_filters_by_topic_position` | Topic filtering end to end over two contracts (one log with no topics, one with `[0xaa…, 0xbb…]`) |
+| `eth_gas_price_returns_the_fixed_price` | `0x3b9aca00` |
+
+A fourth hand-assembled contract, `TWO_TOPIC_LOG`, provides the topics:
+
+```text
+60bb 60aa 6000 6000 a2 00    LOG2(offset 0, size 0, topic0 = 0xaa, topic1 = 0xbb), STOP
+```
+
+**Existing test whose expectation changed:**
+`an_unsupported_method_gets_the_standard_method_not_found_error` used `eth_gasPrice`
+as its example of an unimplemented method. It now uses `eth_getProof`, which is real
+and still unimplemented. One-line comment in code.
+
+`cargo test --workspace`: **75 passed**. `cargo clippy --all-targets`: clean.
+
+### Manual check: stock Foundry, no `cast mktx`
+
+```text
+cast gas-price                               → 1000000000
+cast send --legacy … <bob> --value 1ether    → status 1, gasUsed 21000
+cast send --legacy … --create <initcode>     → status 1, gasUsed 55522, contractAddress 0xe7f1…0512
+cast send --legacy … <contract>              → status 1, gasUsed 43487, 1 log
+cast code <contract>                         → 0x602a60005560006000a000
+cast storage <contract> 0                    → 0x…002a
+cast logs --from-block 0 --address <contract> → 1 log, logIndex 0
+```
+
+None of these needed `--gas-price`, `--nonce`, or `--gas-limit`. The `cast send`
+command is in the README.

@@ -84,8 +84,26 @@ must never hold real funds.**
 
 ## Sending a transaction
 
-Breeja does not implement `eth_gasPrice`, so `cast send` cannot auto-fill its
-parameters. Build and sign the transaction offline with `cast mktx`, then submit
+Breeja implements `eth_gasPrice`, `eth_estimateGas`, and `eth_getTransactionCount`,
+so `cast send` fills in the gas price, gas limit, and nonce itself:
+
+```bash
+cast send --legacy --rpc-url http://localhost:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --value 1ether
+```
+
+Deploying a contract and calling it work the same way:
+
+```bash
+cast send --legacy --rpc-url http://localhost:8545 --private-key <KEY> \
+  --create 0x600b600c600039600b6000f3602a60005560006000a000
+
+cast send --legacy --rpc-url http://localhost:8545 --private-key <KEY> <CONTRACT_ADDRESS>
+cast storage --rpc-url http://localhost:8545 <CONTRACT_ADDRESS> 0   # 0x…2a
+```
+
+Alternatively, build and sign the transaction offline with `cast mktx`, then submit
 the raw bytes.
 
 ```bash
@@ -113,7 +131,7 @@ client waits for confirmation.
 
 ## The JSON-RPC API
 
-The same eleven methods from the assignment, now backed by real state.
+The eleven methods from the assignment, plus the four that contracts need.
 
 | Method | Behaviour |
 | --- | --- |
@@ -125,9 +143,13 @@ The same eleven methods from the assignment, now backed by real state.
 | `eth_getTransactionReceipt` | Receipts for mined transactions; `null` while pending |
 | `eth_getBalance` | Balance at any historical block, or `pending` |
 | `eth_getTransactionCount` | Nonce; `pending` includes queued transactions |
-| `eth_sendRawTransaction` | Validates and queues a signed transfer |
-| `eth_call` | `0x` for a plain transfer; **error** if it needs the EVM |
-| `eth_estimateGas` | `0x5208` (21000); **error** if it needs the EVM |
+| `eth_sendRawTransaction` | Validates and queues a signed transfer, deployment, or contract call |
+| `eth_call` | Executes against any block's state and discards the changes; a revert is error code `3` with the revert data |
+| `eth_estimateGas` | `0x5208` for a plain transfer; binary search plus a 10% margin for anything that runs code |
+| `eth_gasPrice` | `0x3b9aca00` (1 gwei, fixed) |
+| `eth_getCode` | Runtime bytecode at any block; `0x` for an account with no code |
+| `eth_getStorageAt` | One storage slot at any block, as a 32-byte word |
+| `eth_getLogs` | `fromBlock`/`toBlock` or `blockHash`, `address` (one or many), and positional `topics` with `null` wildcards and OR lists |
 
 Anything else returns `-32601 Method not found`.
 
@@ -139,7 +161,8 @@ Deliberately Frontier-era, in `crates/primitives/src/constants.rs`:
 | --- | --- | --- |
 | Chain ID | 1 | |
 | Gas price | 1 gwei, fixed | No fee market; no EIP-1559 |
-| Transfer cost | 21,000 gas | The only cost there is |
+| Transfer cost | 21,000 gas | Contract calls and deployments cost what REVM measures |
+| Execution rules | Shanghai | Via REVM 43; see `EVM-NOTES.md` |
 | Block gas limit | 3,141,592 | Frontier's "pi million" — 149 transfers per block |
 | Block reward | 5 ETH | As on Frontier and Homestead |
 | Target block time | 15s (2s with `--dev`) | |

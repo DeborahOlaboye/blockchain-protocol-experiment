@@ -9,11 +9,12 @@ use jsonrpsee::{
 use node::{
     Chain, ChainConfig, miner,
     testing::{
-        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, STORE_AND_LOG_INITCODE, STORE_AND_RETURN_INITCODE,
-        STORE_THEN_REVERT_INITCODE, address_of, one_eth, sign_call, sign_deployment, sign_transfer,
+        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, STORE_AND_LOG_INITCODE, STORE_AND_LOG_RUNTIME,
+        STORE_AND_RETURN_INITCODE, STORE_THEN_REVERT_INITCODE, TWO_TOPIC_LOG_INITCODE, address_of,
+        one_eth, sign_call, sign_deployment, sign_transfer,
     },
 };
-use primitives::node::BreejaGenesis;
+use primitives::node::{BreejaGenesis, TransactionReceipt};
 use rpc::{RPCContext, start_server};
 use serde_json::Value;
 
@@ -368,6 +369,7 @@ async fn a_transfer_produces_a_transaction_and_a_receipt() {
         .unwrap();
     assert_eq!(receipt["status"], "0x1");
     assert_eq!(receipt["gasUsed"], "0x5208");
+    assert_eq!(receipt["cumulativeGasUsed"], "0x5208");
     assert_eq!(receipt["from"], format!("{alice:#x}"));
     assert_eq!(receipt["to"], format!("{bob:#x}"));
     assert!(
@@ -655,12 +657,194 @@ async fn eth_estimate_gas_is_enough_to_send_the_transaction() {
 async fn an_unsupported_method_gets_the_standard_method_not_found_error() {
     let harness = Harness::start(&[], false).await;
 
-    // `eth_gasPrice` is a real Ethereum method this node does not implement, so it
-    // must come back as -32601 rather than something invented.
-    let result: Result<Value, _> = harness.client.request("eth_gasPrice", rpc_params![]).await;
+    // Changed: eth_gasPrice is now implemented, so eth_getProof stands in as a real but unimplemented method.
+    let result: Result<Value, _> = harness
+        .client
+        .request("eth_getProof", rpc_params![Address::ZERO, Vec::<String>::new(), "latest"])
+        .await;
     let error = result.expect_err("an unregistered method must be an error");
     assert!(
         error.to_string().contains("Method not found") || error.to_string().contains("-32601"),
         "got: {error}"
     );
+}
+
+async fn send_and_wait(harness: &Harness, raw: Bytes) -> TransactionReceipt {
+    let hash = harness.chain.submit_raw_transaction(&raw).unwrap();
+    harness
+        .wait_for("the transaction to be mined", |c| {
+            c.read().get_receipt(&hash).is_some()
+        })
+        .await;
+    harness.chain.read().get_receipt(&hash).unwrap().clone()
+}
+
+#[tokio::test]
+async fn eth_gas_price_returns_the_fixed_price() {
+    let harness = Harness::start(&[], false).await;
+    let price: String = harness
+        .client
+        .request("eth_gasPrice", rpc_params![])
+        .await
+        .unwrap();
+    assert_eq!(price, "0x3b9aca00", "1 gwei");
+}
+
+#[tokio::test]
+async fn eth_get_code_returns_runtime_bytecode_and_0x_without_code() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+    let contract = deploy(&harness, STORE_AND_LOG_INITCODE, 0).await;
+
+    let code: String = harness
+        .client
+        .request("eth_getCode", rpc_params![contract, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(code, STORE_AND_LOG_RUNTIME);
+
+    let eoa: String = harness
+        .client
+        .request("eth_getCode", rpc_params![alice, "latest"])
+        .await
+        .unwrap();
+    assert_eq!(eoa, "0x");
+
+    let before_deployment: String = harness
+        .client
+        .request("eth_getCode", rpc_params![contract, "0x0"])
+        .await
+        .unwrap();
+    assert_eq!(before_deployment, "0x");
+}
+
+#[tokio::test]
+async fn eth_get_storage_at_returns_the_slot_as_a_32_byte_word() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+    let contract = deploy(&harness, STORE_AND_LOG_INITCODE, 0).await;
+    let deployed_at = harness.chain.read().get_block_number();
+
+    let receipt = send_and_wait(
+        &harness,
+        sign_call(DEV_PRIVATE_KEY, contract, Bytes::new(), 1, 100_000).unwrap(),
+    )
+    .await;
+    assert_eq!(receipt.status, 1);
+
+    let slot: String = harness
+        .client
+        .request("eth_getStorageAt", rpc_params![contract, "0x0", "latest"])
+        .await
+        .unwrap();
+    assert_eq!(slot, format!("0x{:064x}", 42));
+    assert_eq!(slot.len(), 66);
+
+    let before_call: String = harness
+        .client
+        .request(
+            "eth_getStorageAt",
+            rpc_params![contract, "0x0", format!("{deployed_at:#x}")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(before_call, format!("0x{}", "0".repeat(64)));
+}
+
+#[tokio::test]
+async fn eth_get_logs_filters_by_block_range_and_address() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+    let contract = deploy(&harness, STORE_AND_LOG_INITCODE, 0).await;
+    let receipt = send_and_wait(
+        &harness,
+        sign_call(DEV_PRIVATE_KEY, contract, Bytes::new(), 1, 100_000).unwrap(),
+    )
+    .await;
+    let block = format!("{:#x}", receipt.block_number);
+    let before = format!("{:#x}", receipt.block_number - 1);
+
+    let found: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({"fromBlock": block, "toBlock": block, "address": contract})],
+        )
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0]["address"], format!("{contract:#x}"));
+    assert_eq!(found[0]["blockNumber"], block);
+    assert_eq!(found[0]["transactionHash"], format!("{:#x}", receipt.transaction_hash));
+    assert_eq!(found[0]["topics"].as_array().unwrap().len(), 0);
+
+    let earlier: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({"fromBlock": "0x0", "toBlock": before, "address": contract})],
+        )
+        .await
+        .unwrap();
+    assert!(earlier.is_empty());
+
+    let other_address: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({"fromBlock": "0x0", "toBlock": "latest", "address": alice})],
+        )
+        .await
+        .unwrap();
+    assert!(other_address.is_empty());
+
+    let by_hash: Vec<Value> = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({"blockHash": receipt.block_hash})],
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_hash.len(), 1);
+}
+
+#[tokio::test]
+async fn eth_get_logs_filters_by_topic_position() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+    let two_topics = deploy(&harness, TWO_TOPIC_LOG_INITCODE, 0).await;
+    let no_topics = deploy(&harness, STORE_AND_LOG_INITCODE, 1).await;
+    for (nonce, to) in [(2, two_topics), (3, no_topics)] {
+        let receipt = send_and_wait(
+            &harness,
+            sign_call(DEV_PRIVATE_KEY, to, Bytes::new(), nonce, 100_000).unwrap(),
+        )
+        .await;
+        assert_eq!(receipt.status, 1);
+    }
+
+    let a = format!("0x{:064x}", 0xaa);
+    let b = format!("0x{:064x}", 0xbb);
+    let c = format!("0x{:064x}", 0xcc);
+    let count = |topics: Value| {
+        let client = harness.client.clone();
+        async move {
+            let logs: Vec<Value> = client
+                .request(
+                    "eth_getLogs",
+                    rpc_params![serde_json::json!({"fromBlock": "earliest", "toBlock": "latest", "topics": topics})],
+                )
+                .await
+                .unwrap();
+            logs.len()
+        }
+    };
+
+    assert_eq!(count(serde_json::json!([])).await, 2);
+    assert_eq!(count(serde_json::json!([a])).await, 1);
+    assert_eq!(count(serde_json::json!([b])).await, 0);
+    assert_eq!(count(serde_json::json!([null, b])).await, 1);
+    assert_eq!(count(serde_json::json!([[c, a]])).await, 1);
+    assert_eq!(count(serde_json::json!([a, b, null])).await, 0);
 }
