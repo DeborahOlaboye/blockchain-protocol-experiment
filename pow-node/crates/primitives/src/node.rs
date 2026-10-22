@@ -515,6 +515,7 @@ impl BlockState {
     pub fn commit_block(
         &mut self,
         accounts: HashMap<Address, Account>,
+        code: HashMap<B256, Bytes>,
         block: Block,
         transactions: Vec<Transaction>,
         receipts: Vec<TransactionReceipt>,
@@ -524,6 +525,7 @@ impl BlockState {
             .retain(|pending| !mined.contains(&pending.hash));
 
         self.accounts = accounts;
+        self.code.extend(code);
         self.block_index.insert(block.hash, block.number);
         for tx in transactions {
             self.transactions.insert(tx.hash, tx);

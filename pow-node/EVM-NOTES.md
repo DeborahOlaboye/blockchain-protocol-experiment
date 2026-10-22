@@ -183,3 +183,81 @@ Decisions that differ from, or go beyond, the Appendix A reference:
 | `writing_a_slot_back_to_zero_removes_it` | Zero-slot removal |
 
 `cargo test --workspace`: **53 passed** (48 baseline + 5). No behaviour change yet.
+
+## Milestone 2: transfers through REVM
+
+`apply_transfer` is gone. `executor.rs` now has `execute_transaction(db, block, tx)`,
+which runs one transaction through REVM and commits its changes to the `BreejaDb`
+snapshot. `execute_block` calls it for every transaction in the batch.
+
+### Mapping
+
+- `PendingTransaction` → `TxEnv`: `tx_type: 0` (legacy), `caller`, `gas_limit`,
+  `gas_price`, `kind: TxKind::Call(to)`, `value`, `nonce`, `chain_id`. Calldata is
+  still empty at this milestone.
+- Block → `BlockEnv` through a new `BlockContext` struct: `number`, `beneficiary`
+  (the miner), `timestamp`, `gas_limit`, `basefee: 0`, `difficulty`, and
+  `prevrandao: Some(parent_hash)`.
+- `CfgEnv::new_with_spec(SpecId::SHANGHAI).with_chain_id(CHAIN_ID)`.
+- `ExecutionResult` → `TxOutcome { success, gas_used, created, logs, output }`, which
+  becomes the `Transaction` and `TransactionReceipt`. `gas_used` comes from
+  `tx_gas_used()`, never the deprecated `gas_used()` (Pitfall 4).
+
+### What had to move
+
+**The block timestamp is now fixed before execution.** Previously the miner
+executed the batch first and only then picked a timestamp for the header. With an
+EVM that is wrong: the `TIMESTAMP` opcode reads `BlockEnv.timestamp`, so the value
+the EVM sees must be the value that ends up in the sealed header. The miner now
+builds a `BlockContext` (number, timestamp, parent hash, difficulty, gas limit,
+miner) first, executes against it, and copies the same timestamp into the header.
+This is the same reasoning as Pitfall 7: anything the EVM reads about "this block"
+has to be known before proof of work starts.
+
+**`commit_block` takes the code map.** The miner snapshots
+`BreejaDb::snapshot(&state)` (accounts, code, last 256 block hashes) under the read
+lock, releases it, executes, and hands back both the accounts and the code. The code
+map is append-only, so `commit_block` extends it rather than replacing it.
+
+### Pitfalls avoided
+
+1. **REVM already pays the miner.** The manual `credit(fee)` to the miner is gone.
+   REVM pays `BlockEnv.beneficiary` itself. The block reward is still paid by
+   `pay_block_reward`, because REVM knows nothing about block rewards. They are
+   Breeja's policy.
+2. **`basefee = 0`**, so nothing is burned and Breeja stays pre-EIP-1559.
+3. **REVM increments the nonce.** The manual `increase_nonce()` is gone.
+6. **Borrow and lock.** `transact` builds the EVM over `&mut *db`, takes
+   `outcome.result` and `outcome.state` out by value, and the EVM is dropped when the
+   function returns, so `db.commit(state)` happens after the mutable borrow has
+   ended. No lock is held: the miner executes on its own snapshot.
+7. **`prevrandao = Some(parent.hash)`.** The current block's hash does not exist yet
+   when the EVM runs.
+
+### Invalid versus failed
+
+`transact` returning `Err` means REVM refused to execute the transaction at all (bad
+nonce, cannot afford `gas_limit × gas_price + value`). Those are still dropped, which
+is why `a_transaction_that_no_longer_applies_is_skipped_not_mined` still passes
+unchanged. `Ok` with a `Revert` or `Halt` result is recorded with `status = 0`; the
+tests for that come in Milestone 3.
+
+### Tests
+
+- New: `a_transfer_through_revm_costs_exactly_21000_gas_and_pays_the_beneficiary_once`.
+  It checks `tx_gas_used() == 21000` and that the beneficiary received exactly
+  `21_000_000_000_000` wei, the figure from Pitfall 1. If the manual fee credit were
+  still there, it would be 42,000 gwei.
+- The seven existing `executor.rs` tests changed **signature only**: they build a
+  `BreejaDb` and a `BlockContext` instead of a bare account map. Every assertion is
+  unchanged, which is what parity means.
+- `the_chain_never_creates_or_destroys_eth_outside_the_block_reward` passes without
+  modification.
+
+`cargo test --workspace`: **54 passed**. `cargo clippy --all-targets`: clean.
+
+### Manual check
+
+`cargo run --release -- --dev`, then the README's `cast mktx` transfer of 1 ETH from
+`0xf39F…2266` to `0x7099…79C8`. It was mined in block 17 with `gasUsed: 0x5208` and
+`status: 0x1`, and the recipient's balance went from 10,000 to 10,001 ETH.
