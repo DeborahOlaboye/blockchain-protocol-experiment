@@ -23,8 +23,16 @@ impl BreejaDb {
         Self {
             accounts: state.accounts_snapshot(),
             code_by_hash: state.code_snapshot(),
-            block_hashes: state.recent_block_hashes(BLOCK_HASH_WINDOW),
+            block_hashes: state.block_hashes_until(state.get_block_number(), BLOCK_HASH_WINDOW),
         }
+    }
+
+    pub fn snapshot_at(state: &BlockState, number: u64) -> Option<Self> {
+        Some(Self {
+            accounts: state.accounts_snapshot_at(number)?,
+            code_by_hash: state.code_snapshot(),
+            block_hashes: state.block_hashes_until(number, BLOCK_HASH_WINDOW),
+        })
     }
 
     fn code_for(&self, code_hash: B256) -> Bytecode {

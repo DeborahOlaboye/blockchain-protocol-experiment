@@ -85,13 +85,17 @@ fn calling_a_contract_changes_storage_and_emits_a_log() {
     let chain = test_chain(&[(alice, one_eth())]);
     let contract = alice.create(0);
 
-    let deploy = sign_deployment(DEV_PRIVATE_KEY, bytes(STORE_AND_LOG_INITCODE), 0, 100_000).unwrap();
+    let deploy =
+        sign_deployment(DEV_PRIVATE_KEY, bytes(STORE_AND_LOG_INITCODE), 0, 100_000).unwrap();
     let call = sign_call(DEV_PRIVATE_KEY, contract, Bytes::new(), 1, 100_000).unwrap();
     let hashes = [
         chain.submit_raw_transaction(&deploy).unwrap(),
         chain.submit_raw_transaction(&call).unwrap(),
     ];
-    assert_eq!(chain.read().get_storage_at(&contract, U256::ZERO), U256::ZERO);
+    assert_eq!(
+        chain.read().get_storage_at(&contract, U256::ZERO),
+        U256::ZERO
+    );
 
     let receipts = mine_until_receipts(&chain, &hashes);
     let receipt = &receipts[1];
@@ -121,8 +125,13 @@ fn a_reverting_transaction_is_mined_with_status_zero_and_still_charged() {
     let chain = test_chain(&[(alice, one_eth())]);
     let contract = alice.create(0);
 
-    let deploy =
-        sign_deployment(DEV_PRIVATE_KEY, bytes(STORE_THEN_REVERT_INITCODE), 0, 100_000).unwrap();
+    let deploy = sign_deployment(
+        DEV_PRIVATE_KEY,
+        bytes(STORE_THEN_REVERT_INITCODE),
+        0,
+        100_000,
+    )
+    .unwrap();
     let call = sign_call(DEV_PRIVATE_KEY, contract, Bytes::new(), 1, 100_000).unwrap();
     let hashes = [
         chain.submit_raw_transaction(&deploy).unwrap(),

@@ -72,7 +72,9 @@ fn decode_and_check(raw: &Bytes) -> Result<DecodedTransaction, anyhow::Error> {
     let gas = envelope.gas_limit();
     let intrinsic = intrinsic_gas(&input, to.is_none());
     if gas < intrinsic {
-        anyhow::bail!("gas limit {gas} is below the intrinsic cost of this transaction ({intrinsic})");
+        anyhow::bail!(
+            "gas limit {gas} is below the intrinsic cost of this transaction ({intrinsic})"
+        );
     }
 
     let gas_price = envelope.max_fee_per_gas();
@@ -194,8 +196,7 @@ mod tests {
     #[test]
     fn intrinsic_gas_matches_revm_under_shanghai() {
         use revm::{
-            context_interface::cfg::gas::calculate_initial_tx_gas,
-            primitives::hardfork::SpecId,
+            context_interface::cfg::gas::calculate_initial_tx_gas, primitives::hardfork::SpecId,
         };
 
         let initcode: &[u8] = &[

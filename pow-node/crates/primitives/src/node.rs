@@ -472,15 +472,19 @@ impl BlockState {
         self.accounts.clone()
     }
 
+    pub fn accounts_snapshot_at(&self, number: u64) -> Option<HashMap<Address, Account>> {
+        self.state_history.get(number as usize).cloned()
+    }
+
     pub fn code_snapshot(&self) -> HashMap<B256, Bytes> {
         self.code.clone()
     }
 
-    pub fn recent_block_hashes(&self, count: usize) -> HashMap<u64, B256> {
-        let skip = self.blocks.len().saturating_sub(count);
-        self.blocks
+    pub fn block_hashes_until(&self, number: u64, count: usize) -> HashMap<u64, B256> {
+        let end = (number as usize + 1).min(self.blocks.len());
+        let start = end.saturating_sub(count);
+        self.blocks[start..end]
             .iter()
-            .skip(skip)
             .map(|block| (block.number, block.hash))
             .collect()
     }

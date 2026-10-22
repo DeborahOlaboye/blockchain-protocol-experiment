@@ -11,10 +11,7 @@
 //! request. So the miner snapshots the state, releases the lock, does its hashing,
 //! and only re-acquires the lock for the instant it takes to commit.
 
-use std::{
-    thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::thread::{self, JoinHandle};
 
 use alloy::primitives::Bytes;
 use primitives::{
@@ -65,16 +62,8 @@ fn run(chain: Chain) {
             )
         };
 
-        let number = parent.number + 1;
-        let context = BlockContext {
-            number,
-            // A block's timestamp must advance, even if the system clock does not.
-            timestamp: unix_now().max(parent.timestamp + 1),
-            parent_hash: parent.hash,
-            difficulty,
-            gas_limit: BLOCK_GAS_LIMIT,
-            miner: config.miner,
-        };
+        let context = BlockContext::on_top_of(&parent, difficulty, config.miner);
+        let number = context.number;
 
         // execute the candidate block, with no lock held
         let execution = execute_block(db, &batch, &context);
@@ -183,12 +172,4 @@ fn run(chain: Chain) {
     }
 
     tracing::info!("miner stopped");
-}
-
-/// Current wall-clock time as a Unix timestamp in seconds.
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

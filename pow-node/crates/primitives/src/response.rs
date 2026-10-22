@@ -4,7 +4,7 @@ use alloy::primitives::{Address, B256, Bytes};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    constants::{EXTRA_DATA, TRANSFER_GAS},
+    constants::EXTRA_DATA,
     node::{Block, Log, Transaction, TransactionReceipt},
 };
 
@@ -223,10 +223,6 @@ fn block_size(block: &Block) -> u64 {
     const TX_BYTES: u64 = 110;
     HEADER_BYTES + EXTRA_DATA.len() as u64 + block.transactions.len() as u64 * TX_BYTES
 }
-
-/// Gas a plain transfer costs. Returned by `eth_estimateGas`, where it is the
-/// only answer a node without an EVM can give.
-pub const TRANSFER_GAS_ESTIMATE: u64 = TRANSFER_GAS;
 
 #[cfg(test)]
 mod tests {

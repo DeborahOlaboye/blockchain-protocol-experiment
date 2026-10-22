@@ -368,3 +368,151 @@ receipt had one log at that address with `topics: []`, `data: 0x`, and `logIndex
   (fixed in Milestone 6).
 - EIP-3860's 49,152-byte initcode size limit is enforced by REVM at execution but not
   by the pool, so an oversized deployment is admitted and then dropped.
+
+## Milestone 4: `eth_call` and `eth_estimateGas`
+
+### One execution path, one difference
+
+Both methods use the same `transact` function as the miner. The only difference from
+a real transaction is that `execute_transaction` calls `db.commit(state)` and the
+simulation path (`run_without_commit`) throws `state` away. REVM's `Database` methods
+only read, so the snapshot itself is never written. The discarded `EvmState` is the
+"throwaway copy" the spec talks about, and no extra clone of the state is needed per
+probe. The unit test `simulating_a_call_returns_its_output_but_writes_nothing`
+compares the whole account map before and after.
+
+The RPC handlers take a `BreejaDb` snapshot under the read lock, release it, and
+only then execute (Pitfall 6). A 20-probe gas estimate never blocks other requests.
+
+### Block context and block tags
+
+A simulation runs as if it were the **next** block on top of the requested one
+(`BlockContext::on_top_of`): number + 1, a fresh timestamp, `prevrandao` = that
+block's hash, and the configured miner as `COINBASE`. That is the environment the
+transaction would actually see if it were sent now.
+
+Because `state_history` already keeps a full account snapshot per block, and code is
+append-only, a block tag costs nothing extra: `BreejaDb::snapshot_at(state, n)`
+builds the database from block `n`. `eth_call` at `"0x0"` against a contract
+deployed later correctly returns `0x`, because there is no code at genesis.
+
+### `CfgEnv` choices (the spec asks me to justify these)
+
+| Check | `eth_call` | `eth_estimateGas` | Why |
+| --- | --- | --- | --- |
+| Nonce (`disable_nonce_check`) | off | off | A simulation is not part of the sender's transaction sequence. Making the caller supply the right nonce adds nothing. |
+| Balance (`disable_balance_check`) | **off** | **on** | `eth_call` asks "what does this code return?", which should not depend on the caller being funded, and callers often omit `from`. `eth_estimateGas` asks "would this succeed if I sent it?", where an unaffordable `value` is exactly the answer the caller needs. |
+| EIP-3607 (`disable_eip3607`) | **off** | on | Tools commonly simulate a call "as" a contract address. A real transaction can never come from a contract, so the estimate keeps the rule. |
+
+`disable_balance_check` and `disable_eip3607` sit behind REVM's
+`optional_balance_check` and `optional_eip3607` cargo features, so those two are now
+enabled in `crates/node/Cargo.toml`. Both default to `false`, so block execution is
+unaffected.
+
+When `gasPrice` is omitted it defaults to 0, as geth does, so the gas itself costs
+nothing in a simulation. When a gas price *is* given, the estimate's upper bound is
+capped at what the sender can afford, `(balance − value) / gasPrice`, as geth does.
+
+### Reverts and halts over RPC
+
+A reverted `eth_call` returns JSON-RPC error **code 3**, message
+`"execution reverted"`, with the revert data as hex in `data`. That is what `cast` and
+other client libraries look for to decode revert reasons. A halt (out of gas, invalid
+opcode) returns `-32000` with the reason, for example `execution halted: OutOfGas(Basic)`.
+Returning `0x` for a failed call would be silently wrong.
+
+### `eth_estimateGas`: binary search
+
+1. `floor = intrinsic_gas(calldata, is_create)`, the same function the mempool uses.
+   `ceiling = min(block gas limit, request.gas, what the sender can afford)`.
+2. Execute once at `ceiling`. If that fails, no gas limit can make it succeed, so
+   return an error carrying the revert data or halt reason.
+3. If `floor` itself succeeds, return it unchanged. This is why a plain transfer
+   estimates to exactly `0x5208`.
+4. Otherwise, binary search `(floor, ceiling]` for the lowest passing limit. That is
+   about 22 probes over the 3.1M range.
+5. Add a 10% margin (capped at `ceiling`), but only when the answer is above the
+   intrinsic cost, that is, only when code actually ran.
+
+The margin exists because the estimate is taken against state *now*, and the
+transaction runs against state *later*. Storage the contract reads may have changed
+in between, and with it the gas.
+
+**The search is a heuristic, not a proof.** It assumes "succeeds with g gas" is
+monotonic in g. A contract can read its remaining gas with the `GAS` opcode and branch
+on it, so it could succeed at 50,000, fail at 60,000, and succeed at 70,000. Binary
+search can return a limit inside a failing island. EIP-150's 63/64 rule makes this
+real even without malicious code: a contract that makes an inner call forwards less
+gas at a lower limit, and the inner call can fail while the outer one survives. The
+final step 2 check at the ceiling only proves *some* limit works, not that the
+returned one does. Geth has the same weakness. The margin makes it rarer, but does
+not remove it.
+
+`the_binary_search_finds_the_lowest_gas_limit_that_succeeds` checks the result is
+exact: the store-and-log call succeeds at `minimal` and fails at `minimal − 1`.
+
+### Removed no-EVM code
+
+- `no_evm` (handlers), `CallRequest::needs_evm` (params), and `TRANSFER_GAS_ESTIMATE`
+  (response) existed only to refuse requests that needed an EVM. All three are gone.
+- The stale doc comments on `call_handler` and `estimate_gas_handler` ("Breeja has no
+  EVM…") are removed.
+- `unix_now` moved from `miner.rs` to `executor.rs`, because `BlockContext::on_top_of`
+  is now shared by the miner and the RPC handlers.
+
+### Tests
+
+New unit tests (`executor.rs`):
+
+| Test | Checks |
+| --- | --- |
+| `simulating_a_call_returns_its_output_but_writes_nothing` | Output is 32-byte 42, account map identical before and after |
+| `a_call_from_an_account_with_no_funds_still_runs` | Balance check disabled for `eth_call` |
+| `the_estimate_for_a_plain_transfer_is_exactly_21000` | Parity, with no margin |
+| `the_binary_search_finds_the_lowest_gas_limit_that_succeeds` | `minimal` passes, `minimal − 1` fails, estimate = minimal + 10% |
+| `estimating_a_transaction_that_always_reverts_is_an_error` | Error carries "execution reverted" |
+| `estimating_a_transfer_the_sender_cannot_afford_is_an_error` | Balance check kept for estimates |
+
+New RPC tests (`json_rpc.rs`), on a real server with the miner running:
+
+| Test | Spec item |
+| --- | --- |
+| `eth_call_returns_contract_output_and_leaves_state_unchanged` | 12: output `0x…2a`, slot 0 still 0 after calling code that writes it, sender nonce unchanged, and `0x` at block `0x0` |
+| `eth_call_reports_a_revert_as_an_error` | Revert is an error, not empty output |
+| `eth_estimate_gas_is_enough_to_send_the_transaction` | 13: estimate, then send with exactly that gas; mined with status 1, `gas_used ≤ estimate`, slot 0 = 42 |
+
+A third test contract was added to `testing.rs` for this. `STORE_AND_RETURN` writes
+42 to slot 0 and returns 42 as a 32-byte word, so a single call proves both
+"returns the right bytes" and "the write was discarded":
+
+```text
+602a 6000 55          storage[0] = 42
+602a 6000 52          memory[0..32] = 42
+6020 6000 f3          return memory[0..32]
+```
+
+**Existing tests whose expectations changed** (each has a one-line comment in code):
+
+- `eth_call_answers_transfers_and_refuses_anything_needing_the_evm` →
+  `eth_call_to_an_account_without_code_returns_no_data`. It used to expect a
+  "no EVM" error for calldata. Calling an address with no code runs nothing, so it
+  returns `0x` with or without calldata, as on Ethereum.
+- `eth_estimate_gas_returns_the_intrinsic_cost_of_a_transfer`: the deployment half
+  expected an error. `0x6080604052` (`PUSH1 0x80 PUSH1 0x40 MSTORE`) is valid
+  initcode, so the estimate now succeeds and must be at least the creation's intrinsic
+  cost.
+- `a_call_needs_an_evm_when_it_carries_calldata_or_creates_a_contract` (params) tested
+  `needs_evm`, which was removed. It is replaced by
+  `calldata_is_read_from_data_or_input`, which tests the helper that survives, so the
+  test count does not drop.
+
+`cargo test --workspace`: **69 passed**. `cargo clippy --all-targets`: clean.
+
+### Manual check against a live `--dev` node, with stock Foundry
+
+```text
+cast call --from 0xf39F…2266 <contract>     → 0x…002a
+cast estimate --from … 0x7099…79C8 --value 1ether → 21000
+cast estimate --from … <contract>           → 47436   (minimum 43,124 + 10%)
+send with --gas-limit 47436                 → status 0x1, gasUsed 43124
+```

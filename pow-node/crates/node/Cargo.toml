@@ -10,7 +10,7 @@ primitives.workspace = true
 alloy.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-revm = "43"
+revm = { version = "43", features = ["optional_balance_check", "optional_eip3607"] }
 
 [dev-dependencies]
 alloy.workspace = true

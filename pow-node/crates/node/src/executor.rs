@@ -1,9 +1,13 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use alloy::primitives::{Address, B256, Bytes, Log, TxKind, U256};
 use primitives::{
-    constants::{BLOCK_REWARD, CHAIN_ID},
-    node::{Account, PendingTransaction, Transaction, TransactionReceipt, hash_list_root},
+    constants::{BLOCK_GAS_LIMIT, BLOCK_REWARD, CHAIN_ID},
+    node::{Account, Block, PendingTransaction, Transaction, TransactionReceipt, hash_list_root},
+    params::CallRequest,
 };
 use revm::{
     Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
@@ -13,7 +17,7 @@ use revm::{
     state::EvmState,
 };
 
-use crate::evm::BreejaDb;
+use crate::{evm::BreejaDb, pool::intrinsic_gas};
 
 /// What executing a batch of transactions produced.
 pub struct Execution {
@@ -45,9 +49,31 @@ pub struct TxOutcome {
     pub created: Option<Address>,
     pub logs: Vec<Log>,
     pub output: Bytes,
+    pub halt_reason: Option<String>,
+}
+
+impl TxOutcome {
+    pub fn failure(&self) -> String {
+        match &self.halt_reason {
+            Some(reason) => format!("execution halted: {reason}"),
+            None => format!("execution reverted: 0x{}", alloy::hex::encode(&self.output)),
+        }
+    }
 }
 
 impl BlockContext {
+    pub fn on_top_of(parent: &Block, difficulty: u8, miner: Address) -> Self {
+        Self {
+            number: parent.number + 1,
+            // A block's timestamp must advance, even if the system clock does not.
+            timestamp: unix_now().max(parent.timestamp + 1),
+            parent_hash: parent.hash,
+            difficulty,
+            gas_limit: BLOCK_GAS_LIMIT,
+            miner,
+        }
+    }
+
     fn block_env(&self) -> BlockEnv {
         BlockEnv {
             number: U256::from(self.number),
@@ -108,6 +134,10 @@ fn summarize(result: &ExecutionResult<HaltReason>) -> TxOutcome {
         created: result.created_address(),
         logs: result.logs().to_vec(),
         output: result.output().cloned().unwrap_or_default(),
+        halt_reason: match result {
+            ExecutionResult::Halt { reason, .. } => Some(format!("{reason:?}")),
+            _ => None,
+        },
     }
 }
 
@@ -119,6 +149,160 @@ pub fn execute_transaction(
     let (result, state) = transact(db, block, cfg_env(), tx_env(tx))?;
     db.commit(state);
     Ok(summarize(&result))
+}
+
+fn call_cfg() -> CfgEnv {
+    let mut cfg = estimate_cfg();
+    cfg.disable_balance_check = true;
+    cfg.disable_eip3607 = true;
+    cfg
+}
+
+fn estimate_cfg() -> CfgEnv {
+    let mut cfg = cfg_env();
+    cfg.disable_nonce_check = true;
+    cfg
+}
+
+fn run_without_commit(
+    db: &mut BreejaDb,
+    block: &BlockContext,
+    cfg: CfgEnv,
+    request: &CallRequest,
+    gas_limit: u64,
+) -> Result<TxOutcome, anyhow::Error> {
+    let (result, _discarded) = transact(db, block, cfg, simulation_tx(request, gas_limit)?)?;
+    Ok(summarize(&result))
+}
+
+fn probe(
+    db: &mut BreejaDb,
+    block: &BlockContext,
+    request: &CallRequest,
+    gas_limit: u64,
+) -> Result<TxOutcome, anyhow::Error> {
+    run_without_commit(db, block, estimate_cfg(), request, gas_limit)
+}
+
+fn simulation_tx(request: &CallRequest, gas_limit: u64) -> Result<TxEnv, anyhow::Error> {
+    let gas_price = match request.gas_price {
+        Some(price) => u128::try_from(price)
+            .map_err(|_| anyhow::anyhow!("gas price {price} does not fit in 128 bits"))?,
+        None => 0,
+    };
+    Ok(TxEnv {
+        tx_type: 0,
+        caller: request.from.unwrap_or_default(),
+        gas_limit,
+        gas_price,
+        kind: match request.to {
+            Some(to) => TxKind::Call(to),
+            None => TxKind::Create,
+        },
+        value: request.value.unwrap_or_default(),
+        data: request.calldata(),
+        chain_id: Some(CHAIN_ID),
+        ..Default::default()
+    })
+}
+
+pub fn simulate(
+    db: &mut BreejaDb,
+    block: &BlockContext,
+    request: &CallRequest,
+    gas_limit: u64,
+) -> Result<TxOutcome, anyhow::Error> {
+    run_without_commit(db, block, call_cfg(), request, gas_limit)
+}
+
+pub fn estimate_gas(
+    db: &mut BreejaDb,
+    block: &BlockContext,
+    request: &CallRequest,
+) -> Result<u64, anyhow::Error> {
+    let floor = intrinsic_gas(&request.calldata(), request.to.is_none());
+    let ceiling = gas_ceiling(db, block, request)?;
+    if ceiling < floor {
+        anyhow::bail!("gas allowance {ceiling} is below the intrinsic cost {floor}");
+    }
+
+    let at_ceiling = probe(db, block, request, ceiling)?;
+    if !at_ceiling.success {
+        anyhow::bail!(
+            "{} (with the maximum of {ceiling} gas, so no gas limit can make it succeed)",
+            at_ceiling.failure()
+        );
+    }
+
+    let minimal = minimal_gas_limit(db, block, request, floor, ceiling);
+    if minimal == floor {
+        return Ok(minimal);
+    }
+    Ok((minimal + minimal / ESTIMATE_MARGIN_DIVISOR).min(ceiling))
+}
+
+const ESTIMATE_MARGIN_DIVISOR: u64 = 10;
+
+fn gas_ceiling(
+    db: &BreejaDb,
+    block: &BlockContext,
+    request: &CallRequest,
+) -> Result<u64, anyhow::Error> {
+    let mut ceiling = block.gas_limit;
+    if let Some(gas) = request.gas {
+        ceiling = ceiling.min(gas.saturating_to::<u64>());
+    }
+
+    let gas_price = request.gas_price.unwrap_or_default();
+    if gas_price > U256::ZERO {
+        let from = request.from.unwrap_or_default();
+        let balance = db
+            .accounts
+            .get(&from)
+            .map(|account| account.balance)
+            .unwrap_or_default();
+        let value = request.value.unwrap_or_default();
+        let spendable = balance.checked_sub(value).ok_or_else(|| {
+            anyhow::anyhow!("insufficient funds: {from} has {balance} but sends {value}")
+        })?;
+        ceiling = ceiling.min((spendable / gas_price).saturating_to::<u64>());
+    }
+    Ok(ceiling)
+}
+
+pub fn minimal_gas_limit(
+    db: &mut BreejaDb,
+    block: &BlockContext,
+    request: &CallRequest,
+    floor: u64,
+    ceiling: u64,
+) -> u64 {
+    let mut succeeds = |gas: u64| {
+        probe(db, block, request, gas)
+            .map(|outcome| outcome.success)
+            .unwrap_or(false)
+    };
+    if succeeds(floor) {
+        return floor;
+    }
+    let (mut failing, mut passing) = (floor, ceiling);
+    while passing - failing > 1 {
+        let middle = failing + (passing - failing) / 2;
+        if succeeds(middle) {
+            passing = middle;
+        } else {
+            failing = middle;
+        }
+    }
+    passing
+}
+
+/// Current wall-clock time as a Unix timestamp in seconds.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Pays the miner for sealing a block.
@@ -229,7 +413,9 @@ pub fn execute_block(
 
 #[cfg(test)]
 mod tests {
-    use primitives::constants::{BLOCK_GAS_LIMIT, DEV_ADDRESS, DEV_ADDRESS_1, GAS_PRICE, TRANSFER_GAS};
+    use primitives::constants::{
+        BLOCK_GAS_LIMIT, DEV_ADDRESS, DEV_ADDRESS_1, GAS_PRICE, TRANSFER_GAS,
+    };
 
     use super::*;
 
@@ -309,7 +495,10 @@ mod tests {
         assert!(called.success);
         assert_eq!(called.logs.len(), 1);
         assert_eq!(called.logs[0].address, contract);
-        assert_eq!(db.accounts[&contract].storage[&U256::ZERO], U256::from(42u64));
+        assert_eq!(
+            db.accounts[&contract].storage[&U256::ZERO],
+            U256::from(42u64)
+        );
     }
 
     #[test]
@@ -336,6 +525,124 @@ mod tests {
         assert_eq!(starved.gas_used, 22_000);
         assert_eq!(db.accounts[&DEV_ADDRESS].nonce, 2);
         assert!(db.accounts[&contract].storage.is_empty());
+        assert!(starved.failure().contains("OutOfGas"));
+    }
+
+    fn deploy(db: &mut BreejaDb, initcode: &str) -> Address {
+        let nonce = db.accounts[&DEV_ADDRESS].nonce;
+        let initcode: Bytes = initcode.parse().unwrap();
+        execute_transaction(
+            db,
+            &block(Address::repeat_byte(0x99)),
+            &contract_tx(None, &initcode, nonce, 200_000),
+        )
+        .unwrap()
+        .created
+        .unwrap()
+    }
+
+    fn call_to(to: Address) -> CallRequest {
+        CallRequest {
+            from: Some(DEV_ADDRESS),
+            to: Some(to),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn simulating_a_call_returns_its_output_but_writes_nothing() {
+        let mut db = funded(one_eth());
+        let contract = deploy(&mut db, crate::testing::STORE_AND_RETURN_INITCODE);
+        let before = db.accounts.clone();
+
+        let outcome = simulate(
+            &mut db,
+            &block(Address::repeat_byte(0x99)),
+            &call_to(contract),
+            BLOCK_GAS_LIMIT,
+        )
+        .unwrap();
+
+        assert!(outcome.success);
+        let mut expected = [0u8; 32];
+        expected[31] = 42;
+        assert_eq!(outcome.output, Bytes::copy_from_slice(&expected));
+        assert_eq!(db.accounts, before);
+    }
+
+    #[test]
+    fn a_call_from_an_account_with_no_funds_still_runs() {
+        let mut db = funded(one_eth());
+        let request = CallRequest {
+            to: Some(DEV_ADDRESS_1),
+            value: Some(U256::from(1u64)),
+            ..Default::default()
+        };
+        let outcome = simulate(
+            &mut db,
+            &block(Address::repeat_byte(0x99)),
+            &request,
+            BLOCK_GAS_LIMIT,
+        )
+        .unwrap();
+        assert!(outcome.success);
+        assert!(outcome.output.is_empty());
+    }
+
+    #[test]
+    fn the_estimate_for_a_plain_transfer_is_exactly_21000() {
+        let mut db = funded(one_eth() * U256::from(10u64));
+        let request = CallRequest {
+            value: Some(one_eth()),
+            ..call_to(DEV_ADDRESS_1)
+        };
+        assert_eq!(
+            estimate_gas(&mut db, &block(Address::repeat_byte(0x99)), &request).unwrap(),
+            21_000
+        );
+    }
+
+    #[test]
+    fn the_binary_search_finds_the_lowest_gas_limit_that_succeeds() {
+        let mut db = funded(one_eth());
+        let contract = deploy(&mut db, crate::testing::STORE_AND_LOG_INITCODE);
+        let context = block(Address::repeat_byte(0x99));
+        let request = call_to(contract);
+
+        let minimal = minimal_gas_limit(&mut db, &context, &request, TRANSFER_GAS, BLOCK_GAS_LIMIT);
+
+        assert!(probe(&mut db, &context, &request, minimal).unwrap().success);
+        assert!(
+            !probe(&mut db, &context, &request, minimal - 1)
+                .unwrap()
+                .success
+        );
+        let estimate = estimate_gas(&mut db, &context, &request).unwrap();
+        assert_eq!(estimate, minimal + minimal / ESTIMATE_MARGIN_DIVISOR);
+    }
+
+    #[test]
+    fn estimating_a_transaction_that_always_reverts_is_an_error() {
+        let mut db = funded(one_eth());
+        let contract = deploy(&mut db, crate::testing::STORE_THEN_REVERT_INITCODE);
+
+        let error = estimate_gas(
+            &mut db,
+            &block(Address::repeat_byte(0x99)),
+            &call_to(contract),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("execution reverted"), "{error}");
+    }
+
+    #[test]
+    fn estimating_a_transfer_the_sender_cannot_afford_is_an_error() {
+        let mut db = funded(one_eth());
+        let request = CallRequest {
+            value: Some(one_eth() * U256::from(2u64)),
+            ..call_to(DEV_ADDRESS_1)
+        };
+        assert!(estimate_gas(&mut db, &block(Address::repeat_byte(0x99)), &request).is_err());
     }
 
     #[test]
