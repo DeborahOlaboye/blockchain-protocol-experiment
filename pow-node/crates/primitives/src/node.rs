@@ -9,8 +9,6 @@ use crate::constants::{
     MIN_DIFFICULTY_LEADING_ZEROS, TRANSFER_GAS,
 };
 
-/// An externally owned account: Ethereum's account record, minus everything a
-/// contract would need.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, RlpEncodable)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -18,6 +16,8 @@ pub struct Account {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
+    #[rlp(skip)]
+    pub storage: HashMap<U256, U256>,
 }
 
 /// A sealed block.
@@ -152,6 +152,7 @@ pub struct BlockState {
     /// this from a trie; Breeja keeps whole snapshots, which is only affordable
     /// because a teaching chain has a handful of accounts.
     state_history: Vec<HashMap<Address, Account>>,
+    code: HashMap<B256, Bytes>,
     /// Block number for a given block hash.
     block_index: HashMap<B256, u64>,
     transactions: HashMap<B256, Transaction>,
@@ -438,6 +439,21 @@ impl BlockState {
         balance.saturating_sub(committed)
     }
 
+    pub fn get_code(&self, address: &Address) -> Bytes {
+        self.code_by_hash(&self.get_account(address).code_hash)
+    }
+
+    pub fn code_by_hash(&self, code_hash: &B256) -> Bytes {
+        self.code.get(code_hash).cloned().unwrap_or_default()
+    }
+
+    pub fn get_storage_at(&self, address: &Address, slot: U256) -> U256 {
+        self.accounts
+            .get(address)
+            .and_then(|account| account.storage.get(&slot).copied())
+            .unwrap_or_default()
+    }
+
     /// Commits to the account set at the chain head in a single hash.
     pub fn state_root(&self) -> B256 {
         state_root_of(&self.accounts)
@@ -447,6 +463,19 @@ impl BlockState {
     /// without holding the state lock.
     pub fn accounts_snapshot(&self) -> HashMap<Address, Account> {
         self.accounts.clone()
+    }
+
+    pub fn code_snapshot(&self) -> HashMap<B256, Bytes> {
+        self.code.clone()
+    }
+
+    pub fn recent_block_hashes(&self, count: usize) -> HashMap<u64, B256> {
+        let skip = self.blocks.len().saturating_sub(count);
+        self.blocks
+            .iter()
+            .skip(skip)
+            .map(|block| (block.number, block.hash))
+            .collect()
     }
 
     // mempool

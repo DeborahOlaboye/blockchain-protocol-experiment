@@ -109,3 +109,77 @@ code hash, and keep only the hash in the account. A real node stores per-block
 *diffs*, or uses a trie whose nodes are shared between versions. For a teaching
 chain with a handful of accounts, full snapshots stay affordable, and I keep them,
 but the cost is now visible.
+
+## Milestone 1: state model
+
+### Representation
+
+- `Account` keeps its four Ethereum fields (`nonce`, `balance`, `storage_root`,
+  `code_hash`) and gains `storage: HashMap<U256, U256>`. The storage map is marked
+  `#[rlp(skip)]`, so the RLP encoding stays the four-field Ethereum account.
+  Storage is committed to through `storage_root`, never inlined.
+- Code is **not** stored in `Account`. `BlockState` has a `code: HashMap<B256, Bytes>`
+  keyed by code hash, and an account holds only the hash. I picked this over storing
+  `Bytecode` inline for three reasons:
+  1. Identical contracts share one copy, which is what REVM's `code_by_hash` assumes.
+  2. Code is immutable, so the map only grows and needs no per-block history. An
+     account's `code_hash` at any historical block is enough to find its code.
+  3. The per-block `state_history` snapshots do not copy bytecode (Part 0, Q4).
+- `primitives` stores code as `alloy` `Bytes`, not REVM's `Bytecode`, so the
+  primitives crate does not depend on REVM. `BreejaDb` converts to `Bytecode` lazily,
+  only for the contracts a transaction actually touches.
+- "No code" stays `code_hash == B256::ZERO` in Breeja, which is what every existing
+  account already has. REVM uses `keccak256("")` (`KECCAK_EMPTY`). The bridge
+  translates both ways, so the state never holds two spellings of "no code", which
+  would give two equal states different roots.
+
+### `BlockState` accessors
+
+`get_code(address)`, `code_by_hash(hash)`, `get_storage_at(address, slot)`,
+`code_snapshot()`, and `recent_block_hashes(n)`.
+
+### `Database` / `DatabaseCommit` (`crates/node/src/evm.rs`)
+
+Implemented on `BreejaDb`, a snapshot built by `BreejaDb::snapshot(&BlockState)`,
+not on `BlockState`. REVM holds `&mut` on its database for the whole execution, and
+`BlockState` is behind the `RwLock` the RPC server reads through.
+
+Decisions that differ from, or go beyond, the Appendix A reference:
+
+- **`basic` returns `None` for an unknown address**, not an empty account. `None`
+  tells REVM the account does not exist. Ethereum's gas rules depend on this: a
+  `CALL` that sends value to a non-existent account pays 25,000 extra gas
+  (`G_newaccount`). Returning an empty account would make every address look like it
+  already existed and under-charge that call.
+- **`basic` returns the code alongside the account info**, so REVM does not need a
+  second `code_by_hash` round trip.
+- **`commit` stores `code.original_bytes()`, not `code.bytes()`.** REVM pads analysed
+  legacy bytecode with trailing zero bytes (`STOP`). The padding is not part of the
+  contract, and `eth_getCode` must not return it.
+- **A storage slot written to zero is removed**, not stored as zero. Zero and absent
+  read identically through `SLOAD`, so keeping both would let two equal states hash
+  to different storage roots (relevant to Milestone 6).
+- **A newly created account has its storage cleared** before its writes are applied
+  (`is_created()`), matching REVM's own `CacheDB`.
+- **EIP-161 state clearing.** An account that a transaction touched and left empty
+  (no nonce, no balance, no code, no storage) is deleted. Shanghai includes
+  EIP-161, and without it a zero-value transfer to a fresh address would add an
+  empty account to the state and change the state root for nothing.
+- `block_hash` serves the last 256 block hashes from the snapshot. I checked that
+  REVM 43 enforces the 256-block window itself (`interpreter/instructions/host.rs`),
+  so the database only needs to hold what is inside it.
+- `type Error = Infallible`, because an in-memory map cannot fail. Every non-zero
+  `code_hash` is inserted by `commit` together with its bytes, so a lookup miss in
+  `code_by_hash` cannot happen. If it ever did, the answer is empty code.
+
+### Tests added (`evm.rs`)
+
+| Test | Checks |
+| --- | --- |
+| `basic_returns_the_balance_and_nonce_of_a_funded_account` | Required test 1 |
+| `basic_returns_none_for_an_address_that_was_never_funded` | Required test 2 (deliberately `None`) |
+| `commit_persists_balance_nonce_code_and_storage` | Required test 3, plus a read-back round trip |
+| `commit_ignores_accounts_revm_only_read` | `is_touched()` filter |
+| `writing_a_slot_back_to_zero_removes_it` | Zero-slot removal |
+
+`cargo test --workspace`: **53 passed** (48 baseline + 5). No behaviour change yet.
