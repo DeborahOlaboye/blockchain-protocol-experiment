@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bloom, BloomInput, Bytes, U256};
 use node::{
     Chain, ChainConfig, miner,
     testing::{
@@ -10,7 +10,7 @@ use node::{
 };
 use primitives::{
     constants::GAS_PRICE,
-    node::{BreejaGenesis, TransactionReceipt},
+    node::{BreejaGenesis, TransactionReceipt, logs_bloom},
 };
 
 fn test_chain(funded: &[(Address, U256)]) -> Chain {
@@ -158,4 +158,44 @@ fn a_reverting_transaction_is_mined_with_status_zero_and_still_charged() {
     assert_eq!(alice_now.balance, one_eth() - spent);
 
     assert_eq!(state.get_storage_at(&contract, U256::ZERO), U256::ZERO);
+}
+
+#[test]
+fn logs_bloom_is_set_for_blocks_with_logs_and_matches_them() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let chain = test_chain(&[(alice, one_eth())]);
+    let contract = alice.create(0);
+
+    let deploy =
+        sign_deployment(DEV_PRIVATE_KEY, bytes(STORE_AND_LOG_INITCODE), 0, 100_000).unwrap();
+    let call = sign_call(DEV_PRIVATE_KEY, contract, Bytes::new(), 1, 100_000).unwrap();
+    let hashes = [
+        chain.submit_raw_transaction(&deploy).unwrap(),
+        chain.submit_raw_transaction(&call).unwrap(),
+    ];
+    let receipts = mine_until_receipts(&chain, &hashes);
+    let (deployed, called) = (&receipts[0], &receipts[1]);
+
+    assert_eq!(deployed.logs_bloom, Bloom::ZERO);
+    assert_ne!(called.logs_bloom, Bloom::ZERO);
+    assert_eq!(called.logs_bloom, logs_bloom(&called.logs));
+    assert!(
+        called
+            .logs_bloom
+            .contains_input(BloomInput::Raw(contract.as_slice()))
+    );
+
+    let state = chain.read();
+    let block = state.get_block_by_hash(&called.block_hash).unwrap();
+    assert!(
+        block
+            .logs_bloom
+            .contains_input(BloomInput::Raw(contract.as_slice()))
+    );
+    let mut expected = Bloom::ZERO;
+    for hash in &block.transactions {
+        expected.accrue_bloom(&state.get_receipt(hash).unwrap().logs_bloom);
+    }
+    assert_eq!(block.logs_bloom, expected);
+    assert_eq!(state.get_block(0).unwrap().logs_bloom, Bloom::ZERO);
 }

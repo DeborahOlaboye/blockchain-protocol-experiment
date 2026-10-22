@@ -1,7 +1,7 @@
 use std::{collections::HashMap, convert::Infallible};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
-use primitives::node::{Account, BlockState};
+use primitives::node::{Account, BlockState, storage_root_of};
 use revm::{
     Database, DatabaseCommit,
     bytecode::Bytecode,
@@ -121,6 +121,7 @@ impl DatabaseCommit for BreejaDb {
                     entry.storage.insert(slot, present);
                 }
             }
+            entry.storage_root = storage_root_of(&entry.storage);
 
             if entry.nonce == 0
                 && entry.balance == U256::ZERO
@@ -197,6 +198,8 @@ mod tests {
         assert_eq!(account.nonce, 1);
         assert_eq!(account.code_hash, code_hash);
         assert_eq!(account.storage[&U256::ZERO], U256::from(42u64));
+        assert_eq!(account.storage_root, storage_root_of(&account.storage));
+        assert_ne!(account.storage_root, B256::ZERO);
         assert_eq!(
             db.code_by_hash[&code_hash],
             Bytes::from_static(&[0x60, 0x2a, 0x60, 0x00, 0x55])
@@ -248,5 +251,6 @@ mod tests {
         db.commit(changes);
 
         assert!(db.accounts[&address].storage.is_empty());
+        assert_eq!(db.accounts[&address].storage_root, B256::ZERO);
     }
 }

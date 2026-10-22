@@ -99,6 +99,7 @@ mod tests {
             state_root: B256::ZERO,
             transaction_root: B256::ZERO,
             receipts_root: B256::ZERO,
+            logs_bloom: Default::default(),
             difficulty: 8,
             timestamp: 1_700_000_000,
             gas_limit: 3_141_592,

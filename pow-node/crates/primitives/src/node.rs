@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy::primitives::{Address, B256, Bloom, Bytes, U256, keccak256};
 use alloy_rlp::{Encodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{
     BLOCK_GAS_LIMIT, EXTRA_DATA, GAS_PRICE, MAX_DIFFICULTY_LEADING_ZEROS,
-    MIN_DIFFICULTY_LEADING_ZEROS, TRANSFER_GAS,
+    MIN_DIFFICULTY_LEADING_ZEROS,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, RlpEncodable)]
@@ -33,6 +33,7 @@ pub struct Block {
     pub state_root: B256,
     pub transaction_root: B256,
     pub receipts_root: B256,
+    pub logs_bloom: Bloom,
     /// Number of leading zero bits `hash` must have for this block to be valid.
     pub difficulty: u8,
     /// Sum of every ancestor's difficulty plus this block's. The heaviest chain
@@ -64,6 +65,7 @@ pub struct BlockHeader {
     pub state_root: B256,
     pub transaction_root: B256,
     pub receipts_root: B256,
+    pub logs_bloom: Bloom,
     pub difficulty: u8,
     pub timestamp: u64,
     pub gas_limit: u64,
@@ -109,6 +111,7 @@ pub struct TransactionReceipt {
     pub effective_gas_price: u128,
     pub contract_address: Option<Address>,
     pub logs: Vec<Log>,
+    pub logs_bloom: Bloom,
     pub status: u8,
 }
 
@@ -231,6 +234,7 @@ impl Block {
             state_root: self.state_root,
             transaction_root: self.transaction_root,
             receipts_root: self.receipts_root,
+            logs_bloom: self.logs_bloom,
             difficulty: self.difficulty,
             timestamp: self.timestamp,
             gas_limit: self.gas_limit,
@@ -304,9 +308,50 @@ pub fn state_root_of(accounts: &HashMap<Address, Account>) -> B256 {
     let mut buf = Vec::new();
     for (address, account) in entries {
         buf.extend_from_slice(address.as_slice());
-        account.encode(&mut buf);
+        let committed = Account {
+            nonce: account.nonce,
+            balance: account.balance,
+            storage_root: storage_root_of(&account.storage),
+            code_hash: account.code_hash,
+            storage: HashMap::new(),
+        };
+        committed.encode(&mut buf);
     }
     keccak256(buf)
+}
+
+pub fn storage_root_of(storage: &HashMap<U256, U256>) -> B256 {
+    if storage.is_empty() {
+        return B256::ZERO;
+    }
+    let mut slots: Vec<(&U256, &U256)> = storage.iter().collect();
+    slots.sort_by_key(|(slot, _)| **slot);
+
+    let mut buf = Vec::with_capacity(slots.len() * 64);
+    for (slot, value) in slots {
+        buf.extend_from_slice(&slot.to_be_bytes::<32>());
+        buf.extend_from_slice(&value.to_be_bytes::<32>());
+    }
+    keccak256(buf)
+}
+
+pub fn logs_bloom<'a>(logs: impl IntoIterator<Item = &'a Log>) -> Bloom {
+    let mut bloom = [0u8; 256];
+    for log in logs {
+        accrue(&mut bloom, log.address.as_slice());
+        for topic in &log.topics {
+            accrue(&mut bloom, topic.as_slice());
+        }
+    }
+    Bloom::from(bloom)
+}
+
+fn accrue(bloom: &mut [u8; 256], input: &[u8]) {
+    let hash = keccak256(input);
+    for pair in hash[..6].chunks(2) {
+        let bit = (u16::from_be_bytes([pair[0], pair[1]]) & 2047) as usize;
+        bloom[255 - bit / 8] |= 1 << (bit % 8);
+    }
 }
 
 /// Hashes an ordered list of hashes into a single root.
@@ -348,6 +393,7 @@ impl BlockState {
             state_root: state_root_of(&state.accounts),
             transaction_root: B256::ZERO,
             receipts_root: B256::ZERO,
+            logs_bloom: Bloom::ZERO,
             difficulty,
             timestamp: 0,
             gas_limit: BLOCK_GAS_LIMIT,
@@ -365,6 +411,7 @@ impl BlockState {
             state_root: header.state_root,
             transaction_root: header.transaction_root,
             receipts_root: header.receipts_root,
+            logs_bloom: header.logs_bloom,
             difficulty: header.difficulty,
             timestamp: header.timestamp,
             gas_limit: header.gas_limit,
@@ -524,14 +571,12 @@ impl BlockState {
         self.mempool.iter().any(|tx| &tx.hash == hash)
     }
 
-    /// The transactions the next block would include: as many as fit in one
-    /// block's gas limit, oldest first.
+    /// The transactions the next block could include, oldest first.
     ///
     /// This does not remove them. The miner may spend a long time failing to seal
     /// a block, and a transaction must stay pending until it is actually mined.
     pub fn peek_mempool_batch(&self) -> Vec<PendingTransaction> {
-        let max_txs = (BLOCK_GAS_LIMIT / TRANSFER_GAS) as usize;
-        self.mempool.iter().take(max_txs).cloned().collect()
+        self.mempool.clone()
     }
 
     // block production
@@ -576,6 +621,37 @@ impl BlockState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::TRANSFER_GAS;
+
+    #[test]
+    fn logs_bloom_matches_the_yellow_paper_reference() {
+        assert_eq!(logs_bloom(&[]), Bloom::ZERO);
+
+        let logs = vec![
+            Log {
+                address: Address::repeat_byte(0x11),
+                topics: vec![B256::repeat_byte(0xaa), B256::repeat_byte(0xbb)],
+                data: Bytes::from_static(&[1, 2, 3]),
+                log_index: 0,
+            },
+            Log {
+                address: Address::repeat_byte(0x22),
+                topics: Vec::new(),
+                data: Bytes::new(),
+                log_index: 1,
+            },
+        ];
+        let mut reference = Bloom::ZERO;
+        for log in &logs {
+            reference.accrue_log(&alloy::primitives::Log::new_unchecked(
+                log.address,
+                log.topics.clone(),
+                log.data.clone(),
+            ));
+        }
+        assert_eq!(logs_bloom(&logs), reference);
+        assert_ne!(logs_bloom(&logs), Bloom::ZERO);
+    }
 
     #[test]
     fn leading_zero_bits_counts_what_it_says() {
@@ -659,6 +735,48 @@ mod tests {
         let mut three = one.clone();
         three.insert(a, Account::new(U256::from(99u64)));
         assert_ne!(state_root_of(&one), state_root_of(&three));
+    }
+
+    #[test]
+    fn the_state_root_commits_to_storage_and_code() {
+        let contract = Address::repeat_byte(0x01);
+        let with_slot = |value: u64| {
+            let mut account = Account::new(U256::from(1u64));
+            account.storage.insert(U256::ZERO, U256::from(value));
+            HashMap::from([(contract, account)])
+        };
+
+        assert_ne!(state_root_of(&with_slot(42)), state_root_of(&with_slot(43)));
+        assert_eq!(state_root_of(&with_slot(42)), state_root_of(&with_slot(42)));
+        assert_ne!(
+            state_root_of(&with_slot(42)),
+            state_root_of(&HashMap::from([(contract, Account::new(U256::from(1u64)))]))
+        );
+
+        let mut other_slot = with_slot(42);
+        other_slot
+            .get_mut(&contract)
+            .unwrap()
+            .storage
+            .insert(U256::from(1u64), U256::from(42u64));
+        assert_ne!(state_root_of(&with_slot(42)), state_root_of(&other_slot));
+
+        let mut with_code = with_slot(42);
+        with_code.get_mut(&contract).unwrap().code_hash = B256::repeat_byte(0xcc);
+        assert_ne!(state_root_of(&with_slot(42)), state_root_of(&with_code));
+    }
+
+    #[test]
+    fn a_storage_root_ignores_insertion_order() {
+        let mut one = HashMap::new();
+        one.insert(U256::from(1u64), U256::from(10u64));
+        one.insert(U256::from(2u64), U256::from(20u64));
+        let mut two = HashMap::new();
+        two.insert(U256::from(2u64), U256::from(20u64));
+        two.insert(U256::from(1u64), U256::from(10u64));
+
+        assert_eq!(storage_root_of(&one), storage_root_of(&two));
+        assert_eq!(storage_root_of(&HashMap::new()), B256::ZERO);
     }
 
     #[test]

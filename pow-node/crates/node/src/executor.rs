@@ -3,10 +3,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use alloy::primitives::{Address, B256, Bytes, Log, TxKind, U256};
+use alloy::primitives::{Address, B256, Bloom, Bytes, Log, TxKind, U256};
 use primitives::{
     constants::{BLOCK_GAS_LIMIT, BLOCK_REWARD, CHAIN_ID},
-    node::{Account, Block, PendingTransaction, Transaction, TransactionReceipt, hash_list_root},
+    node::{
+        Account, Block, PendingTransaction, Transaction, TransactionReceipt, hash_list_root,
+        logs_bloom,
+    },
     params::CallRequest,
 };
 use revm::{
@@ -29,6 +32,7 @@ pub struct Execution {
     pub gas_used: u64,
     pub transaction_root: B256,
     pub receipts_root: B256,
+    pub logs_bloom: Bloom,
     pub state_root: B256,
 }
 
@@ -329,6 +333,9 @@ pub fn execute_block(
     let mut log_index = 0u64;
 
     for tx in batch {
+        if tx.gas > block.gas_limit - gas_used {
+            continue;
+        }
         match execute_transaction(&mut db, block, tx) {
             Ok(outcome) => {
                 let index = transactions.len() as u64;
@@ -380,6 +387,7 @@ pub fn execute_block(
                     cummulative_gas_used: gas_used,
                     effective_gas_price: tx.gas_price,
                     contract_address: outcome.created,
+                    logs_bloom: logs_bloom(&logs),
                     logs,
                     status: outcome.success as u8,
                 });
@@ -396,12 +404,18 @@ pub fn execute_block(
         tracing::error!(%error, "failed to pay block reward");
     }
 
+    let mut block_bloom = Bloom::ZERO;
+    for receipt in &receipts {
+        block_bloom.accrue_bloom(&receipt.logs_bloom);
+    }
+
     let tx_hashes: Vec<B256> = transactions.iter().map(|tx| tx.hash).collect();
     let receipt_hashes: Vec<B256> = receipts.iter().map(|r| r.transaction_hash).collect();
 
     Execution {
         transaction_root: hash_list_root(&tx_hashes),
         receipts_root: hash_list_root(&receipt_hashes),
+        logs_bloom: block_bloom,
         state_root: primitives::node::state_root_of(&db.accounts),
         accounts: db.accounts,
         code: db.code_by_hash,

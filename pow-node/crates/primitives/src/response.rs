@@ -1,6 +1,9 @@
 use std::fmt::LowerHex;
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::{
+    consensus::EMPTY_OMMER_ROOT_HASH,
+    primitives::{Address, B256, Bloom, Bytes, U256},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -32,6 +35,10 @@ pub fn data_hash(hash: &B256) -> String {
     format!("{hash:#x}")
 }
 
+pub fn data_bloom(bloom: &Bloom) -> String {
+    format!("0x{}", alloy::hex::encode(bloom))
+}
+
 pub fn data_word(value: U256) -> String {
     format!("0x{value:064x}")
 }
@@ -48,10 +55,13 @@ pub struct BlockResponse {
     pub number: String,
     pub hash: String,
     pub parent_hash: String,
+    pub sha3_uncles: String,
+    pub mix_hash: String,
     pub state_root: String,
     #[serde(rename = "transactionsRoot")]
     pub transaction_root: String,
     pub receipts_root: String,
+    pub logs_bloom: String,
     pub difficulty: String,
     pub total_difficulty: String,
     pub timestamp: String,
@@ -64,6 +74,7 @@ pub struct BlockResponse {
     /// Transaction hashes, or full transaction objects when the caller asked for
     /// them with the `fullTransactions` flag.
     pub transactions: Vec<serde_json::Value>,
+    pub uncles: Vec<String>,
 }
 
 /// A transaction, as `eth_getTransactionByHash` returns it.
@@ -152,9 +163,12 @@ impl BlockResponse {
             number: quantity(block.number),
             hash: data_hash(&block.hash),
             parent_hash: data_hash(&block.parent_hash),
+            sha3_uncles: data_hash(&EMPTY_OMMER_ROOT_HASH),
+            mix_hash: data_hash(&B256::ZERO),
             state_root: data_hash(&block.state_root),
             transaction_root: data_hash(&block.transaction_root),
             receipts_root: data_hash(&block.receipts_root),
+            logs_bloom: data_bloom(&block.logs_bloom),
             difficulty: quantity(block.difficulty),
             total_difficulty: quantity(block.total_difficulty),
             timestamp: quantity(block.timestamp),
@@ -165,6 +179,7 @@ impl BlockResponse {
             nonce: data_u64(block.nonce),
             size: quantity(block_size(block)),
             transactions,
+            uncles: Vec::new(),
         }
     }
 }
@@ -210,8 +225,7 @@ impl From<&TransactionReceipt> for TransactionReceiptResponse {
                 .iter()
                 .map(|log| LogResponse::new(receipt, log))
                 .collect(),
-            // A bloom filter over no logs is 256 zero bytes.
-            logs_bloom: format!("0x{}", "00".repeat(256)),
+            logs_bloom: data_bloom(&receipt.logs_bloom),
             status: quantity(receipt.status),
             tx_type: "0x0".to_owned(),
         }

@@ -129,6 +129,27 @@ curl -s -X POST http://localhost:8545 -H 'Content-Type: application/json' \
 A `null` receipt means "not mined yet" — which is exactly how every Ethereum
 client waits for confirmation.
 
+## Demo: a Solidity vault
+
+`demo/Vault.sol` is a small ETH vault: `deposit()` is payable, `withdraw(amount)`
+sends ETH back with an internal `CALL`, balances live in a `mapping`, every movement
+emits an indexed event, and over-withdrawing reverts with a custom error.
+
+```bash
+./demo/deploy-and-call.sh
+```
+
+The script starts a `--dev` node if nothing is listening on `RPC_URL` (default
+`http://127.0.0.1:8545`), compiles the contract with `solc --evm-version shanghai`
+(or uses the committed `demo/Vault.bin`), and then, using only stock `cast`:
+deploys it, deposits from two accounts, withdraws, reads the contract back through
+`eth_call` and `eth_getStorageAt`, filters the events with `eth_getLogs`, estimates
+gas, decodes a revert, and mines a reverting transaction to show it is still charged.
+It needs Foundry, and `jq`.
+
+The same scenario runs as a Rust test, with no external tools:
+`cargo test -p node --test solidity`.
+
 ## The JSON-RPC API
 
 The eleven methods from the assignment, plus the four that contracts need.

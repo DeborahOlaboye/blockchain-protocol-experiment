@@ -4,8 +4,8 @@ use alloy::eips::Decodable2718;
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use primitives::{
     constants::{
-        CHAIN_ID, GAS_PRICE, INITCODE_WORD_GAS, TRANSFER_GAS, TX_CREATE_GAS, TX_DATA_NON_ZERO_GAS,
-        TX_DATA_ZERO_GAS,
+        BLOCK_GAS_LIMIT, CHAIN_ID, GAS_PRICE, INITCODE_WORD_GAS, MAX_INITCODE_SIZE, TRANSFER_GAS,
+        TX_CREATE_GAS, TX_DATA_NON_ZERO_GAS, TX_DATA_ZERO_GAS,
     },
     node::{BlockState, PendingTransaction},
 };
@@ -74,6 +74,15 @@ fn decode_and_check(raw: &Bytes) -> Result<DecodedTransaction, anyhow::Error> {
     if gas < intrinsic {
         anyhow::bail!(
             "gas limit {gas} is below the intrinsic cost of this transaction ({intrinsic})"
+        );
+    }
+    if gas > BLOCK_GAS_LIMIT {
+        anyhow::bail!("gas limit {gas} exceeds the block gas limit ({BLOCK_GAS_LIMIT})");
+    }
+    if to.is_none() && input.len() > MAX_INITCODE_SIZE {
+        anyhow::bail!(
+            "initcode is {} bytes, above the {MAX_INITCODE_SIZE}-byte limit",
+            input.len()
         );
     }
 

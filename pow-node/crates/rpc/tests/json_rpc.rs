@@ -807,6 +807,26 @@ async fn eth_get_logs_filters_by_block_range_and_address() {
         .await
         .unwrap();
     assert_eq!(by_hash.len(), 1);
+
+    let empty_bloom = format!("0x{}", "00".repeat(256));
+    let rpc_receipt: Value = harness
+        .client
+        .request(
+            "eth_getTransactionReceipt",
+            rpc_params![receipt.transaction_hash],
+        )
+        .await
+        .unwrap();
+    let rpc_block: Value = harness
+        .client
+        .request("eth_getBlockByNumber", rpc_params![block, false])
+        .await
+        .unwrap();
+    for bloom in [&rpc_receipt["logsBloom"], &rpc_block["logsBloom"]] {
+        let bloom = bloom.as_str().unwrap();
+        assert_eq!(bloom.len(), 2 + 512);
+        assert_ne!(bloom, empty_bloom);
+    }
 }
 
 #[tokio::test]
@@ -847,4 +867,56 @@ async fn eth_get_logs_filters_by_topic_position() {
     assert_eq!(count(serde_json::json!([null, b])).await, 1);
     assert_eq!(count(serde_json::json!([[c, a]])).await, 1);
     assert_eq!(count(serde_json::json!([a, b, null])).await, 0);
+}
+
+#[tokio::test]
+async fn blocks_receipts_and_logs_parse_as_standard_ethereum_types() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth())], true).await;
+    let contract = deploy(&harness, STORE_AND_LOG_INITCODE, 0).await;
+    let receipt = send_and_wait(
+        &harness,
+        sign_call(DEV_PRIVATE_KEY, contract, Bytes::new(), 1, 100_000).unwrap(),
+    )
+    .await;
+
+    let block: Value = harness
+        .client
+        .request(
+            "eth_getBlockByNumber",
+            rpc_params![format!("{:#x}", receipt.block_number), true],
+        )
+        .await
+        .unwrap();
+    let parsed: alloy::rpc::types::Block = serde_json::from_value(block).unwrap();
+    assert_eq!(parsed.header.number, receipt.block_number);
+    assert_eq!(parsed.header.ommers_hash, alloy::consensus::EMPTY_OMMER_ROOT_HASH);
+    assert!(parsed.header.logs_bloom.contains_input(alloy::primitives::BloomInput::Raw(
+        contract.as_slice()
+    )));
+
+    let rpc_receipt: Value = harness
+        .client
+        .request(
+            "eth_getTransactionReceipt",
+            rpc_params![receipt.transaction_hash],
+        )
+        .await
+        .unwrap();
+    let parsed: alloy::rpc::types::TransactionReceipt =
+        serde_json::from_value(rpc_receipt).unwrap();
+    assert!(parsed.status());
+    assert_eq!(parsed.inner.logs().len(), 1);
+
+    let logs: Value = harness
+        .client
+        .request(
+            "eth_getLogs",
+            rpc_params![serde_json::json!({"address": contract, "fromBlock": "earliest"})],
+        )
+        .await
+        .unwrap();
+    let parsed: Vec<alloy::rpc::types::Log> = serde_json::from_value(logs).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].address(), contract);
 }
